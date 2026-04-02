@@ -153,16 +153,35 @@ tr.atm .sk{background:rgba(240,180,41,.22)!important;color:var(--atm)!important}
 
 <!-- UPLOAD PANEL -->
 <div class="upload-panel">
-  <label class="upbox">
-    <input type="file" id="opt-input" multiple accept=".pdf">
-    <div class="upbox-title">Options DMR PDFs</div>
-    <div class="upbox-sub">CT_YYYY_MM_DD.pdf · up to 7 files</div>
-  </label>
-  <label class="upbox fut-box">
-    <input type="file" id="fut-input" multiple accept=".pdf">
-    <div class="upbox-title" style="color:var(--amber)">Futures Prices PDF</div>
-    <div class="upbox-sub">CT_YYYY_MM_DD-2.pdf · daily settlement</div>
-  </label>
+  <div style="display:flex;flex-direction:column;gap:6px;min-width:220px">
+    <div style="display:flex;gap:8px;align-items:center">
+      <div style="font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Source:</div>
+      <button class="stab on" id="src-github" onclick="setSource('github')">GitHub Auto</button>
+      <button class="stab" id="src-manual" onclick="setSource('manual')">Manual Upload</button>
+    </div>
+    <!-- GitHub panel -->
+    <div id="panel-github" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div style="font-size:10px;color:var(--text2)">
+        <span style="color:var(--text3);font-size:8px">REPO</span>
+        <span style="color:var(--atm);font-weight:700;margin-left:4px">BMR-Com/ct-options</span>
+      </div>
+      <button onclick="fetchFromGitHub()" style="background:var(--blue);border:none;border-radius:4px;color:#fff;font-family:'Courier New',monospace;font-size:9px;font-weight:700;padding:4px 12px;cursor:pointer;letter-spacing:.05em">LOAD LATEST PDFs</button>
+      <span style="font-size:8px;color:var(--text3)">Fetches all PDFs from pdfs/ folder automatically</span>
+    </div>
+    <!-- Manual panel -->
+    <div id="panel-manual" style="display:none;gap:8px;flex-wrap:wrap">
+      <label class="upbox" style="min-width:160px;padding:7px 12px">
+        <input type="file" id="opt-input" multiple accept=".pdf">
+        <div class="upbox-title">Options DMR PDFs</div>
+        <div class="upbox-sub">CT_YYYY_MM_DD.pdf</div>
+      </label>
+      <label class="upbox fut-box" style="min-width:160px;padding:7px 12px">
+        <input type="file" id="fut-input" multiple accept=".pdf">
+        <div class="upbox-title" style="color:var(--amber)">Futures Prices PDF</div>
+        <div class="upbox-sub">CT_YYYY_MM_DD-2.pdf</div>
+      </label>
+    </div>
+  </div>
   <div class="file-list" id="file-list"></div>
 </div>
 
@@ -445,7 +464,7 @@ tr.atm .sk{background:rgba(240,180,41,.22)!important;color:var(--atm)!important}
   </div>
 </div>
 
-<div class="statusbar" id="sb">Ready — upload options PDFs and a futures prices PDF</div>
+<div class="statusbar" id="sb">Click "LOAD LATEST PDFs" to auto-fetch from GitHub · or switch to Manual Upload</div>
 
 <script>
 // ═══════════════════ CONFIG ═══════════════════
@@ -661,6 +680,115 @@ function getIV(exp,strike,isCall,dayData){
   return avgIV(exp,strike,dayData);
 }
 
+// ═══════════════════ SOURCE TOGGLE ═══════════════════
+function setSource(src){
+  document.getElementById('src-github').classList.toggle('on', src==='github');
+  document.getElementById('src-manual').classList.toggle('on', src==='manual');
+  document.getElementById('panel-github').style.display = src==='github'?'flex':'none';
+  document.getElementById('panel-manual').style.display = src==='manual'?'flex':'none';
+}
+
+// ═══════════════════ GITHUB AUTO-FETCH ═══════════════════
+const GITHUB_REPO = 'BMR-Com/ct-options';
+const GITHUB_PDF_PATH = 'pdfs';
+const RAW_BASE = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/${GITHUB_PDF_PATH}`;
+const API_BASE = `https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_PDF_PATH}`;
+
+async function fetchFromGitHub(){
+  showOv('Fetching file list from GitHub...');
+  setSB('Connecting to GitHub...');
+  try{
+    const res = await fetch(API_BASE, {headers:{Accept:'application/vnd.github.v3+json'}});
+    if(!res.ok) throw new Error(`GitHub API returned ${res.status}. Check repo is public.`);
+    const files = await res.json();
+    const pdfs = files.filter(f=>f.name.endsWith('.pdf')).sort((a,b)=>a.name.localeCompare(b.name));
+    if(!pdfs.length){ hideOv(); setSB('No PDF files found in pdfs/ folder'); return; }
+
+    setSB(`Found ${pdfs.length} PDFs — downloading...`);
+
+    // Separate options PDFs (CT_YYYY_MM_DD.pdf) from futures PDFs (CT_YYYY_MM_DD-2.pdf)
+    const optPDFs = pdfs.filter(f=>!f.name.includes('-2.'));
+    const futPDFs = pdfs.filter(f=>f.name.includes('-2.'));
+
+    // Load up to 7 most recent options PDFs
+    const toLoad = optPDFs.slice(-7);
+    let loaded = 0;
+
+    for(let i=0; i<toLoad.length; i++){
+      const f = toLoad[i];
+      setOvProg(`Parsing ${i+1}/${toLoad.length}: ${f.name}`);
+      addFI(f.name,'load','options');
+      try{
+        const arrayBuf = await fetchGitHubPDF(f.download_url);
+        const txt = await extractPDFText(arrayBuf);
+        const dt = parseDateFromText(txt) || parseDateFromFilename(f.name);
+        if(!dt){ updateFI(f.name,'err','no date'); continue; }
+        const data = parseOptionsPDF(txt);
+        if(!Object.keys(data.calls).length && !Object.keys(data.puts).length){
+          updateFI(f.name,'err','no data parsed'); continue;
+        }
+        days[dt] = data;
+        updateFI(f.name,'ok', dt);
+        loaded++;
+      } catch(e){ updateFI(f.name,'err','fetch error'); console.error(e); }
+    }
+
+    // Load most recent futures PDF
+    if(futPDFs.length){
+      const latestFut = futPDFs[futPDFs.length-1];
+      setOvProg(`Parsing futures: ${latestFut.name}`);
+      addFI(latestFut.name,'load','futures');
+      try{
+        const arrayBuf = await fetchGitHubPDF(latestFut.download_url);
+        const txt = await extractPDFText(arrayBuf);
+        const prices = parseFuturesPDF(txt);
+        Object.assign(futPrices, prices);
+        updateFI(latestFut.name,'fut',`${Object.keys(prices).length} contracts`);
+      } catch(e){ updateFI(latestFut.name,'err','fetch error'); console.error(e); }
+    }
+
+    hideOv();
+    refreshDates();
+    renderAll();
+    setSB(`Loaded ${loaded} options files + ${futPDFs.length?1:0} futures file from GitHub · ${GITHUB_REPO}`);
+
+  } catch(e){
+    hideOv();
+    setSB(`GitHub fetch failed: ${e.message}`);
+    console.error(e);
+  }
+}
+
+async function fetchGitHubPDF(url){
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.arrayBuffer();
+}
+
+async function extractPDFText(arrayBuffer){
+  const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+  let txt = '';
+  for(let i=1; i<=pdf.numPages; i++){
+    const pg = await pdf.getPage(i);
+    const ct = await pg.getTextContent();
+    const lines = {};
+    ct.items.forEach(it=>{
+      const ly = Math.round(it.transform[5]);
+      if(!lines[ly]) lines[ly]=[];
+      lines[ly].push({str:it.str, x:it.transform[4]});
+    });
+    Object.keys(lines).map(Number).sort((a,b)=>b-a).forEach(y=>{
+      txt += lines[y].sort((a,b)=>a.x-b.x).map(r=>r.str).join(' ') + '\n';
+    });
+  }
+  return txt;
+}
+
+function parseDateFromFilename(name){
+  const m = name.match(/(\d{4})[_\-](\d{2})[_\-](\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+}
+
 // ═══════════════════ FILE UPLOAD HANDLERS ═══════════════════
 document.getElementById('opt-input').addEventListener('change',async e=>{
   const files=Array.from(e.target.files).slice(0,7);
@@ -671,7 +799,7 @@ document.getElementById('opt-input').addEventListener('change',async e=>{
     setOvProg(`File ${i+1}/${files.length}: ${f.name}`);
     addFI(f.name,'load','options');
     try{
-      const txt=await pdfText(f);
+      const ab=await f.arrayBuffer();const txt=await extractPDFText(ab);
       const dt=parseDateFromText(txt);
       if(!dt){updateFI(f.name,'err','no date found');continue;}
       const data=parseOptionsPDF(txt);
@@ -696,7 +824,7 @@ document.getElementById('fut-input').addEventListener('change',async e=>{
     setOvProg(`${f.name}`);
     addFI(f.name,'load','futures');
     try{
-      const txt=await pdfText(f);
+      const ab=await f.arrayBuffer();const txt=await extractPDFText(ab);
       const dt=parseDateFromText(txt)||'unknown';
       const prices=parseFuturesPDF(txt);
       const count=Object.keys(prices).length;
