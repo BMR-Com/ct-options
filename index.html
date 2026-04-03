@@ -189,6 +189,11 @@ tr.atm .sk{background:rgba(240,180,41,.22)!important;color:var(--atm)!important}
     <span style="font-size:8px;color:var(--text3);margin-left:6px">r=4.5% · Black-76</span>
   </div>
 </div>
+<!-- OPTION EXPIRY DATES ROW -->
+<div id="ltd-row" style="background:var(--bg3);border-bottom:0.5px solid var(--border);padding:3px 14px;display:none;gap:14px;flex-wrap:wrap;align-items:center">
+  <span style="font-size:8px;color:var(--text3);text-transform:uppercase;letter-spacing:.05em">Option LTD:</span>
+  <div id="ltd-vals" style="display:flex;gap:10px;flex-wrap:wrap;font-size:9px"></div>
+</div>
 
 <!-- MAIN NAV -->
 <div class="nav">
@@ -521,6 +526,7 @@ const COMMODITIES = {
       NOV28:'2028-10-20',DEC28:'2028-11-10',JAN29:'2028-12-15',MAR29:'2029-02-09'
     },
     pillars: ['MAY26','JUL26','DEC26','MAR27','JUL27','DEC27','JUL28','DEC28'],
+    strikeStep: 1,
     // nextFutMap removed
   },
   KC: {
@@ -549,6 +555,7 @@ const COMMODITIES = {
       MAR28:'2028-02-11'
     },
     pillars: ['MAY26','JUL26','SEP26','DEC26','MAR27','SEP27','DEC27','MAR28'],
+    strikeStep: 2.5,
   },
   SB: {
     label: 'Sugar No.11', ticker: 'SB', unit: '¢/lb',
@@ -581,6 +588,7 @@ const COMMODITIES = {
       JAN29:'2028-12-15',MAR29:'2029-02-15'
     },
     pillars: ['MAY26','JUL26','OCT26','MAR27','JUL27','OCT27'],
+    strikeStep: 0.25,
   },
 };
 
@@ -1222,8 +1230,9 @@ function buildVolSurface(exp, dayData, dateStr){
     const {smile}=_vsCache[smileKey];
     if(smile.length>=3){
       // For each integer strike ±15 from ATM, compute w via smile shape
-      for(let dK=-20;dK<=20;dK++){
-        const K=Math.round(F)+dK;
+      const _step=getComm().strikeStep||1;
+      for(let i=-20;i<=20;i++){
+        const K=Math.round(Math.round(F/_step)*_step*100)/100+Math.round(i*_step*100)/100;
         if(wByK[K]!=null) continue; // real data takes priority
         const k=Math.log(K/F);
         // Interpolate excess_w from smile
@@ -1561,6 +1570,21 @@ function renderFutPrices(){
   // Update header with key settle prices
   const hfut=document.getElementById('h-fut');
   if(hfut) hfut.textContent=EXP_ORDER.filter(e=>futPrices[e]).slice(0,4).map(e=>`${EXP_LBL[e]||e}:${futPrices[e].toFixed(2)}`).join(' · ')||'—';
+  // Populate LTD dates row
+  const ltdRow=document.getElementById('ltd-row');
+  const ltdVals=document.getElementById('ltd-vals');
+  if(ltdRow&&ltdVals){
+    const ltdExps=EXP_ORDER.filter(e=>getLTD(e));
+    if(ltdExps.length){
+      ltdRow.style.display='flex';
+      ltdVals.innerHTML=ltdExps.map(e=>{
+        const ltd=getLTD(e);
+        const daysLeft=Math.max(0,Math.round((new Date(ltd).getTime()-new Date(refDate).getTime())/(1000*60*60*24)));
+        const col=daysLeft<14?'var(--red)':daysLeft<45?'var(--amber)':'var(--text2)';
+        return`<span style="color:${col}">${EXP_LBL[e]||e}:<b style="color:var(--text)">${ltd}</b><span style="color:var(--text3);font-size:7px"> (${daysLeft}d)</span></span>`;
+      }).join('');
+    } else ltdRow.style.display='none';
+  }
 }
 function getActiveExp(dayData){
   if(!dayData)return[];
@@ -2232,7 +2256,8 @@ function renderGreeks(){
   const atm=F;
   // Expand to ±20 strikes from ATM (includes synthetic vol surface strikes)
   const syntheticRange=[];
-  for(let dK=-20;dK<=20;dK++) syntheticRange.push(Math.round(atm)+dK);
+  const _gStep=getComm().strikeStep||1;
+  for(let i=-20;i<=20;i++) syntheticRange.push(Math.round(Math.round(atm/_gStep)*_gStep*100)/100+Math.round(i*_gStep*100)/100);
   const allSt=new Set([...strikes,...syntheticRange]);
   const byDist=[...allSt].sort((a,b)=>Math.abs(a-atm)-Math.abs(b-atm));
   const keep=new Set(byDist.slice(0,41));
@@ -2386,7 +2411,8 @@ function getSmileData(dayData, exp, side, dateStr){
   const T=getT(exp,dk); if(T<=0)return[];
   const marketK=new Set([...Object.keys(dayData.calls?.[exp]||{}),...Object.keys(dayData.puts?.[exp]||{})].map(Number));
   const allK=new Set([...marketK]);
-  for(let dK=-20;dK<=20;dK++) allK.add(Math.round(F)+dK);
+  const _sStep=getComm().strikeStep||1;
+  for(let i=-20;i<=20;i++) allK.add(Math.round(Math.round(F/_sStep)*_sStep*100)/100+Math.round(i*_sStep*100)/100);
   const pts=[];
   for(const K of allK){
     const iv=avgIV(exp,K,dayData,dk);
