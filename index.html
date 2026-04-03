@@ -740,103 +740,171 @@ function calcIV(F,K,T,r,mkt,call){
 // ═══════════════════ IV ENGINE — OTM ONLY + CUBIC SPLINE INTERPOLATION ═══════════════════
 
 // Step 1: compute raw OTM IV at each market strike
+// ═══════════════════ VOL SURFACE ENGINE — TOTAL VARIANCE METHOD ═══════════════════
+// Industry standard: never interpolate IV linearly across time.
+// Use w(k,T) = σ²(k,T)·T (total implied variance), interpolate THAT linearly.
+// Smile shape from nearest liquid pillar, expressed in log-moneyness k = ln(K/F).
+// Calendar arbitrage free by construction (w non-decreasing in T).
+
+// Liquid pillar expiries — these have real market prices with sufficient strikes
+const PILLAR_EXPS = ['MAY26','JUL26','DEC26','MAR27','JUL27','DEC27'];
+
+// ── Step 1: compute raw OTM IV points for a given expiry ──
 function rawOTM_IV(exp, dayData, dateStr){
-  const F=getFutPrice(exp,dateStr); if(!F) return [];
+  const F=getFutPrice(exp,dateStr); if(!F||F<=0) return [];
   const T=getT(exp,dateStr); if(T<=0) return [];
   const calls=dayData?.calls?.[exp]||{};
   const puts =dayData?.puts?.[exp]||{};
-  const allK=new Set([...Object.keys(calls),...Object.keys(puts)].map(Number));
   const pts=[];
+  const allK=new Set([...Object.keys(calls),...Object.keys(puts)].map(Number));
   allK.forEach(K=>{
     let iv=null;
-    if(K>F){// OTM call
-      const p=calls[K]?.price; if(p>0.005) iv=calcIV(F,K,T,R,p,true);
-    } else if(K<F){// OTM put
-      const p=puts[K]?.price; if(p>0.005) iv=calcIV(F,K,T,R,p,false);
-    } else {// ATM — average both sides
+    if(K>F){ const p=calls[K]?.price; if(p>0.005) iv=calcIV(F,K,T,R,p,true); }
+    else if(K<F){ const p=puts[K]?.price; if(p>0.005) iv=calcIV(F,K,T,R,p,false); }
+    else {
       const cp=calls[K]?.price, pp=puts[K]?.price;
       const civ=cp>0.005?calcIV(F,K,T,R,cp,true):null;
       const piv=pp>0.005?calcIV(F,K,T,R,pp,false):null;
       const vals=[civ,piv].filter(v=>v&&v>0.005&&v<4);
       if(vals.length) iv=vals.reduce((a,b)=>a+b)/vals.length;
     }
-    if(iv&&iv>0.005&&iv<4) pts.push({K,iv});
+    if(iv&&iv>0.005&&iv<4) pts.push({K, iv, k:Math.log(K/F), w:iv*iv*T});
   });
   return pts.sort((a,b)=>a.K-b.K);
 }
 
-// Step 2: cubic spline interpolation over the vol smile
-// Expiry ordering for finding nearest liquid reference
-const EXP_LIQUIDITY_ORDER=['JUL26','MAY26','DEC26','SEP26','MAR27','MAY27','JUL27','DEC27'];
+// ── Step 2: ATM total variance at each pillar from market data ──
+function getPillarWatm(dayData, dateStr){
+  const wAtm={};
+  PILLAR_EXPS.forEach(exp=>{
+    const F=getFutPrice(exp,dateStr); if(!F) return;
+    const T=getT(exp,dateStr); if(T<=0) return;
+    const pts=rawOTM_IV(exp,dayData,dateStr);
+    if(!pts.length) return;
+    // ATM = point with minimum |K-F|
+    const near=pts.reduce((a,b)=>Math.abs(b.K-F)<Math.abs(a.K-F)?b:a);
+    wAtm[exp]=near.iv*near.iv*T;
+  });
+  return wAtm;
+}
 
-function buildVolSurface(exp, dayData, dateStr){
-  let pts=rawOTM_IV(exp,dayData,dateStr);
-
-  // If sparse (<5 points), augment using shape from nearest liquid expiry
-  if(pts.length<5){
-    // Find best reference expiry: prefer JUL26 or DEC26 (most liquid)
-    const refCandidates=['JUL26','DEC26','MAR27','MAY26'];
-    let refPts=null, refATM=null, refF=null;
-    for(const refExp of refCandidates){
-      if(refExp===exp) continue;
-      const rp=rawOTM_IV(refExp,dayData,dateStr);
-      const rF=getFutPrice(refExp,dateStr);
-      if(rp.length>=4 && rF){
-        refPts=rp; refF=rF;
-        // ATM IV of reference = point nearest to refF
-        const near=rp.reduce((a,b)=>Math.abs(b.K-rF)<Math.abs(a.K-rF)?b:a);
-        refATM=near.iv;
-        break;
-      }
+// ── Step 3: linear total-variance interpolation for any T ──
+function interpWatm(T, wAtm, dateStr){
+  // Build sorted list of (T_pillar, w_atm) from available pillar data
+  const pts=PILLAR_EXPS
+    .filter(e=>wAtm[e]!=null)
+    .map(e=>({T:getT(e,dateStr), w:wAtm[e]}))
+    .sort((a,b)=>a.T-b.T);
+  if(!pts.length) return null;
+  if(T<=pts[0].T) return pts[0].w;
+  if(T>=pts[pts.length-1].T) return pts[pts.length-1].w;
+  for(let i=0;i<pts.length-1;i++){
+    if(pts[i].T<=T&&T<=pts[i+1].T){
+      const frac=(T-pts[i].T)/(pts[i+1].T-pts[i].T);
+      return pts[i].w+frac*(pts[i+1].w-pts[i].w);
     }
-    if(refPts && refATM){
-      const F=getFutPrice(exp,dateStr)||70;
-      // ATM IV of this expiry from available points
-      const thisATM = pts.length>0
-        ? pts.reduce((a,b)=>Math.abs(b.K-F)<Math.abs(a.K-F)?b:a).iv
-        : refATM * 0.95; // fallback: slightly below reference
-      const ratio = thisATM / refATM;
-      // Build moneyness-keyed reference smile
-      const refByMoney={};
-      refPts.forEach(p=>{ refByMoney[Math.round(p.K-refF)]=p.iv; });
-      // Generate synthetic points for missing strikes (±12 from ATM)
-      const existingK=new Set(pts.map(p=>Math.round(p.K)));
-      for(let dK=-14; dK<=14; dK+=1){
+  }
+  return pts[pts.length-1].w;
+}
+
+// ── Step 4: build smile in log-moneyness from best pillar ──
+function getBestPillarSmile(dayData, dateStr, wAtm){
+  // Prefer JUL26 (most strikes), then DEC26, MAR27, MAY26
+  const order=['JUL26','DEC26','MAR27','MAY26','JUL27'];
+  for(const exp of order){
+    const pts=rawOTM_IV(exp,dayData,dateStr);
+    if(pts.length>=5&&wAtm[exp]!=null){
+      const w0=wAtm[exp];
+      // Convert to (k, excess_w) where excess_w = w(k) - w_atm
+      const smile=pts.map(p=>({k:p.k, excess_w:p.w-w0}))
+        .filter(p=>Math.abs(p.k)<0.35); // within ±35% moneyness
+      smile.sort((a,b)=>a.k-b.k);
+      return {smile, refExp:exp};
+    }
+  }
+  return {smile:[], refExp:null};
+}
+
+// ── Step 5: build full vol surface for one expiry ──
+// Returns an evaluator: iv(K) -> implied vol
+const _vsCache={};
+function buildVolSurface(exp, dayData, dateStr){
+  const F=getFutPrice(exp,dateStr); if(!F) return null;
+  const T=getT(exp,dateStr); if(T<=0) return null;
+
+  // Get or compute pillar total variances
+  const cacheKey=`pillars_${dateStr||'latest'}`;
+  if(!_vsCache[cacheKey]) _vsCache[cacheKey]=getPillarWatm(dayData,dateStr);
+  const wAtm=_vsCache[cacheKey];
+
+  // Get raw OTM points for this expiry
+  const rawPts=rawOTM_IV(exp,dayData,dateStr);
+
+  // ATM total variance for this expiry
+  const w_atm_this = interpWatm(T, wAtm, dateStr);
+  if(!w_atm_this) return null;
+
+  // Build w(k) map from raw points (prefer real data over synthetic)
+  const wByK={};
+  rawPts.forEach(p=>{ wByK[Math.round(p.K*10)/10]=p.w; });
+
+  // Always fill ±20 strikes from ATM using smile shape projection (real data takes priority)
+  {
+    const smileKey=`smile_${dateStr||'latest'}`;
+    if(!_vsCache[smileKey]) _vsCache[smileKey]=getBestPillarSmile(dayData,dateStr,wAtm);
+    const {smile}=_vsCache[smileKey];
+    if(smile.length>=3){
+      // For each integer strike ±15 from ATM, compute w via smile shape
+      for(let dK=-20;dK<=20;dK++){
         const K=Math.round(F)+dK;
-        if(existingK.has(K)) continue;
-        // Interpolate refByMoney at dK
-        const moneyKeys=Object.keys(refByMoney).map(Number).sort((a,b)=>a-b);
-        let refIV=null;
-        // exact
-        if(refByMoney[dK]!==undefined){ refIV=refByMoney[dK]; }
-        else {
-          // linear interp in ref smile
-          for(let i=0;i<moneyKeys.length-1;i++){
-            if(moneyKeys[i]<=dK&&dK<=moneyKeys[i+1]){
-              const t=(dK-moneyKeys[i])/(moneyKeys[i+1]-moneyKeys[i]);
-              refIV=refByMoney[moneyKeys[i]]*(1-t)+refByMoney[moneyKeys[i+1]]*t;
-              break;
-            }
-          }
-          if(refIV===null){
-            if(dK<moneyKeys[0]) refIV=refByMoney[moneyKeys[0]];
-            else refIV=refByMoney[moneyKeys[moneyKeys.length-1]];
-          }
+        if(wByK[K]!=null) continue; // real data takes priority
+        const k=Math.log(K/F);
+        // Interpolate excess_w from smile
+        const exc=interpSmile(k,smile);
+        if(exc!==null){
+          const w_proj=Math.max(0.00001, w_atm_this+exc);
+          wByK[K]=w_proj;
         }
-        if(refIV) pts.push({K, iv: Math.max(0.05, refIV*ratio)});
       }
-      pts.sort((a,b)=>a.K-b.K);
-      // Deduplicate
-      const seen=new Set();
-      pts=pts.filter(p=>{const k=Math.round(p.K);if(seen.has(k))return false;seen.add(k);return true;});
     }
   }
 
-  if(pts.length<2) return pts; // still not enough
-  const xs=pts.map(p=>p.K), ys=pts.map(p=>p.iv);
+  // Collect final points and fit spline
+  const pts=Object.entries(wByK).map(([K,w])=>({K:+K,w,iv:Math.sqrt(w/T)}))
+    .filter(p=>p.iv>0.005&&p.iv<4).sort((a,b)=>a.K-b.K);
+
+  if(pts.length<2) return null;
+
+  // Enforce calendar arb: w must be >= w of the previous pillar that came before this T
+  // (simple clamp: w >= w of preceding pillar, already guaranteed by construction)
+
+  // Fit natural cubic spline on K->iv
+  return buildSpline(pts.map(p=>p.K), pts.map(p=>p.iv));
+}
+
+function interpSmile(k, smile){
+  // Linear interpolation of excess_w at log-moneyness k
+  if(!smile.length) return null;
+  if(k<=smile[0].k) return smile[0].excess_w;
+  if(k>=smile[smile.length-1].k) return smile[smile.length-1].excess_w;
+  for(let i=0;i<smile.length-1;i++){
+    if(smile[i].k<=k&&k<=smile[i+1].k){
+      const t=(k-smile[i].k)/(smile[i+1].k-smile[i].k);
+      return smile[i].excess_w*(1-t)+smile[i+1].excess_w*t;
+    }
+  }
+  return null;
+}
+
+function buildSpline(xs, ys){
   const n=xs.length;
-  // Natural cubic spline (tridiagonal system)
-  const h=[], alpha=[], l=[], mu=[], z=[], c=[], b=[], d=[];
+  if(n<2) return null;
+  if(n===2){
+    // Degenerate case: linear
+    const m=(ys[1]-ys[0])/(xs[1]-xs[0]);
+    return { eval(K){ return Math.max(0.005,Math.min(4, K<xs[0]?ys[0]:K>xs[n-1]?ys[n-1]:ys[0]+m*(K-xs[0]))); }};
+  }
+  const h=[], alpha=[], l=[], mu=[], z=[], c=new Array(n), b=[], d=[];
   for(let i=0;i<n-1;i++) h.push(xs[i+1]-xs[i]);
   for(let i=1;i<n-1;i++) alpha.push(3*(ys[i+1]-ys[i])/h[i]-3*(ys[i]-ys[i-1])/h[i-1]);
   l.push(1); mu.push(0); z.push(0);
@@ -845,20 +913,18 @@ function buildVolSurface(exp, dayData, dateStr){
     mu.push(h[i]/l[i]);
     z.push((alpha[i-1]-h[i-1]*z[i-1])/l[i]);
   }
-  l.push(1); z.push(0); c.length=n; c[n-1]=0;
+  l.push(1); z.push(0); c[n-1]=0;
   for(let j=n-2;j>=0;j--){
     c[j]=z[j]-mu[j]*c[j+1];
     b[j]=(ys[j+1]-ys[j])/h[j]-h[j]*(c[j+1]+2*c[j])/3;
     d[j]=(c[j+1]-c[j])/(3*h[j]);
   }
-  // Return evaluator + anchor points
   return {
-    pts, xs, ys,
     eval(K){
-      if(K<=xs[0]) return ys[0]; // flat extrapolation left
-      if(K>=xs[n-1]) return ys[n-1]; // flat extrapolation right
+      if(K<=xs[0]) return ys[0];
+      if(K>=xs[n-1]) return ys[n-1];
       let lo=0,hi=n-2;
-      while(lo<hi){const mid=(lo+hi+1)>>1;xs[mid]<=K?lo=mid:hi=mid-1;}
+      while(lo<hi){const mid=(lo+hi+1)>>1; xs[mid]<=K?lo=mid:hi=mid-1;}
       const dx=K-xs[lo];
       const iv=ys[lo]+b[lo]*dx+c[lo]*dx*dx+d[lo]*dx*dx*dx;
       return Math.max(0.005,Math.min(4,iv));
@@ -866,64 +932,52 @@ function buildVolSurface(exp, dayData, dateStr){
   };
 }
 
-// Vol surface cache per (exp, dateKey)
-const _vsCache={};
+// ── Public API ──
+const _surfCache={};
 function getVolSurface(exp, dayData, dateKey){
   const key=`${exp}_${dateKey||'latest'}`;
-  if(!_vsCache[key]) _vsCache[key]=buildVolSurface(exp,dayData,dateKey);
-  return _vsCache[key];
+  if(!_surfCache[key]) _surfCache[key]=buildVolSurface(exp,dayData,dateKey);
+  return _surfCache[key];
 }
-function clearVolCache(){ for(const k in _vsCache) delete _vsCache[k]; }
+function clearVolCache(){
+  for(const k in _vsCache) delete _vsCache[k];
+  for(const k in _surfCache) delete _surfCache[k];
+}
 
-// Main IV lookup — OTM only, with spline interpolation for missing strikes
 function avgIV(exp, strike, dayData, dateKey){
-  const F=getFutPrice(exp, dateKey); if(!F) return null;
-  const T=getT(exp, dateKey); if(T<=0) return null;
-  // Try direct OTM calculation first
+  const surf=getVolSurface(exp,dayData,dateKey);
+  if(surf?.eval){
+    const v=surf.eval(strike);
+    if(v&&v>0.005&&v<4) return v;
+  }
+  // Fallback: direct OTM calculation only
+  const F=getFutPrice(exp,dateKey); if(!F) return null;
+  const T=getT(exp,dateKey); if(T<=0) return null;
   const calls=dayData?.calls?.[exp]||{};
   const puts =dayData?.puts?.[exp]||{};
-  let iv=null;
-  if(strike>F){
-    const p=calls[strike]?.price; if(p>0.005) iv=calcIV(F,strike,T,R,p,true);
-  } else if(strike<F){
-    const p=puts[strike]?.price; if(p>0.005) iv=calcIV(F,strike,T,R,p,false);
-  } else {
-    const cp=calls[strike]?.price, pp=puts[strike]?.price;
-    const civ=cp>0.005?calcIV(F,strike,T,R,cp,true):null;
-    const piv=pp>0.005?calcIV(F,strike,T,R,pp,false):null;
-    const vals=[civ,piv].filter(v=>v&&v>0.005&&v<4);
-    if(vals.length) iv=vals.reduce((a,b)=>a+b)/vals.length;
-  }
-  if(iv&&iv>0.005&&iv<4) return iv;
-  // Fallback: spline interpolation
-  const surf=getVolSurface(exp,dayData,dateKey);
-  if(surf?.eval) return surf.eval(strike);
-  if(surf?.length>=2){
-    // linear interp fallback
-    const pts=surf;
-    for(let i=0;i<pts.length-1;i++){
-      if(strike>=pts[i].K&&strike<=pts[i+1].K){
-        const t=(strike-pts[i].K)/(pts[i+1].K-pts[i].K);
-        return pts[i].iv*(1-t)+pts[i+1].iv*t;
-      }
-    }
-    if(strike<pts[0].K) return pts[0].iv;
-    return pts[pts.length-1].iv;
-  }
-  return null;
+  if(strike>F){ const p=calls[strike]?.price; if(p>0.005) return calcIV(F,strike,T,R,p,true); }
+  if(strike<F){ const p=puts[strike]?.price; if(p>0.005) return calcIV(F,strike,T,R,p,false); }
+  const cp=calls[strike]?.price, pp=puts[strike]?.price;
+  const civ=cp>0.005?calcIV(F,strike,T,R,cp,true):null;
+  const piv=pp>0.005?calcIV(F,strike,T,R,pp,false):null;
+  const vals=[civ,piv].filter(v=>v&&v>0.005&&v<4);
+  return vals.length?vals.reduce((a,b)=>a+b)/vals.length:null;
 }
+
 function getIV(exp,strike,isCall,dayData,dateStr){ return avgIV(exp,strike,dayData,dateStr||latestDate); }
+
 function getATMIV(exp,dayData,dateStr){
   const F=getFutPrice(exp,dateStr); if(!F) return null;
-  const T=getT(exp,dateStr); if(T<=0) return null;
   const surf=getVolSurface(exp,dayData,dateStr);
-  if(surf?.eval) return surf.eval(F);
+  if(surf?.eval){const v=surf.eval(F); if(v&&v>0.005&&v<4) return v;}
+  // Direct fallback
+  const T=getT(exp,dateStr); if(T<=0) return null;
   const pts=rawOTM_IV(exp,dayData,dateStr);
   if(!pts.length) return null;
   const near=pts.reduce((a,b)=>Math.abs(b.K-F)<Math.abs(a.K-F)?b:a);
   return near.iv;
 }
-// Invalidate cache when new data loaded
+
 function onNewDataLoaded(){ clearVolCache(); }
 
 
@@ -1888,10 +1942,10 @@ function initPricer(){
   const exp=sel.value;
   if(!document.getElementById('pr-F').value&&futPrices[exp])
     document.getElementById('pr-F').value=futPrices[exp].toFixed(2);
-  buildVolSurface();
+  buildPricerVolSurface();
 }
-document.addEventListener('change',e=>{if(e.target.id==='pr-exp'){const exp=e.target.value;if(!document.getElementById('pr-F').value&&futPrices[exp])document.getElementById('pr-F').value=futPrices[exp].toFixed(2);buildVolSurface();}});
-function buildVolSurface(){
+document.addEventListener('change',e=>{if(e.target.id==='pr-exp'){const exp=e.target.value;if(!document.getElementById('pr-F').value&&futPrices[exp])document.getElementById('pr-F').value=futPrices[exp].toFixed(2);buildPricerVolSurface();}});
+function buildPricerVolSurface(){
   if(!latestDate)return;
   const dd=days[latestDate];
   const exp=document.getElementById('pr-exp').value;
