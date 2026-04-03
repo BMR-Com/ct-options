@@ -537,12 +537,19 @@ const TAB_DESC={
 };
 
 // ═══════════════════ STATE ═══════════════════
-let days={};       // dateStr -> {calls:{exp:{strike:{oi,vol,price,oiChange,delta}}}, puts:{...}}
-let futPrices={};  // exp -> settle price (from latest futures PDF)
-let futDates={};   // exp -> date string
+let days={};            // dateStr -> {calls:{exp:{strike:{...}}}, puts:{...}}
+let futPricesByDate={}; // dateStr -> {exp -> settle price}  — one per futures PDF date
+let futPrices={};       // exp -> latest settle price (for display/fallback)
 let latestDate=null, prevDate=null, weekDate=null;
 let activeTab='oi';
 let charts={};
+
+// Get futures price for a specific date (falls back to latest)
+function getFutPrice(exp, dateStr){
+  if(dateStr && futPricesByDate[dateStr] && futPricesByDate[dateStr][exp])
+    return futPricesByDate[dateStr][exp];
+  return futPrices[exp] || null;
+}
 
 // ═══════════════════ PDF TEXT EXTRACTION ═══════════════════
 async function pdfText(file){
@@ -694,26 +701,130 @@ function calcIV(F,K,T,r,mkt,call){
   }
   const iv=(lo+hi)/2; return(iv>0.01&&iv<4)?iv:null;
 }
-// Average call+put IV using put-call parity (more robust)
-function avgIV(exp,strike,dayData){
-  const F=futPrices[exp]; if(!F)return null;
-  const T=getT(exp);
-  const cRec=dayData?.calls?.[exp]?.[strike];
-  const pRec=dayData?.puts?.[exp]?.[strike];
-  // OTM rule: use CALL price only if strike >= spot (OTM/ATM call)
-  //           use PUT price only if strike <= spot (OTM/ATM put)
-  // This avoids inflated IV from wide ITM bid-ask spreads
-  const useCall = strike >= F && cRec?.price > 0.005;
-  const usePut  = strike <= F && pRec?.price > 0.005;
-  const cIV = useCall ? calcIV(F,strike,T,R,cRec.price,true)  : null;
-  const pIV = usePut  ? calcIV(F,strike,T,R,pRec.price,false) : null;
-  // At ATM (strike===F) average both; otherwise use the OTM side only
-  const vals=[cIV,pIV].filter(v=>v!=null&&v>0.005&&v<4);
-  return vals.length ? vals.reduce((a,b)=>a+b)/vals.length : null;
+// ═══════════════════ IV ENGINE — OTM ONLY + CUBIC SPLINE INTERPOLATION ═══════════════════
+
+// Step 1: compute raw OTM IV at each market strike
+function rawOTM_IV(exp, dayData, dateStr){
+  const F=getFutPrice(exp,dateStr); if(!F) return [];
+  const T=getT(exp); if(T<=0) return [];
+  const calls=dayData?.calls?.[exp]||{};
+  const puts =dayData?.puts?.[exp]||{};
+  const allK=new Set([...Object.keys(calls),...Object.keys(puts)].map(Number));
+  const pts=[];
+  allK.forEach(K=>{
+    let iv=null;
+    if(K>F){// OTM call
+      const p=calls[K]?.price; if(p>0.005) iv=calcIV(F,K,T,R,p,true);
+    } else if(K<F){// OTM put
+      const p=puts[K]?.price; if(p>0.005) iv=calcIV(F,K,T,R,p,false);
+    } else {// ATM — average both sides
+      const cp=calls[K]?.price, pp=puts[K]?.price;
+      const civ=cp>0.005?calcIV(F,K,T,R,cp,true):null;
+      const piv=pp>0.005?calcIV(F,K,T,R,pp,false):null;
+      const vals=[civ,piv].filter(v=>v&&v>0.005&&v<4);
+      if(vals.length) iv=vals.reduce((a,b)=>a+b)/vals.length;
+    }
+    if(iv&&iv>0.005&&iv<4) pts.push({K,iv});
+  });
+  return pts.sort((a,b)=>a.K-b.K);
 }
-function getIV(exp,strike,isCall,dayData){
-  return avgIV(exp,strike,dayData);
+
+// Step 2: cubic spline interpolation over the vol smile
+function buildVolSurface(exp, dayData, dateStr){
+  const pts=rawOTM_IV(exp,dayData,dateStr);
+  if(pts.length<2) return pts; // not enough for spline
+  const xs=pts.map(p=>p.K), ys=pts.map(p=>p.iv);
+  const n=xs.length;
+  // Natural cubic spline (tridiagonal system)
+  const h=[], alpha=[], l=[], mu=[], z=[], c=[], b=[], d=[];
+  for(let i=0;i<n-1;i++) h.push(xs[i+1]-xs[i]);
+  for(let i=1;i<n-1;i++) alpha.push(3*(ys[i+1]-ys[i])/h[i]-3*(ys[i]-ys[i-1])/h[i-1]);
+  l.push(1); mu.push(0); z.push(0);
+  for(let i=1;i<n-1;i++){
+    l.push(2*(xs[i+1]-xs[i-1])-h[i-1]*mu[i-1]);
+    mu.push(h[i]/l[i]);
+    z.push((alpha[i-1]-h[i-1]*z[i-1])/l[i]);
+  }
+  l.push(1); z.push(0); c.length=n; c[n-1]=0;
+  for(let j=n-2;j>=0;j--){
+    c[j]=z[j]-mu[j]*c[j+1];
+    b[j]=(ys[j+1]-ys[j])/h[j]-h[j]*(c[j+1]+2*c[j])/3;
+    d[j]=(c[j+1]-c[j])/(3*h[j]);
+  }
+  // Return evaluator + anchor points
+  return {
+    pts, xs, ys,
+    eval(K){
+      if(K<=xs[0]) return ys[0]; // flat extrapolation left
+      if(K>=xs[n-1]) return ys[n-1]; // flat extrapolation right
+      let lo=0,hi=n-2;
+      while(lo<hi){const mid=(lo+hi+1)>>1;xs[mid]<=K?lo=mid:hi=mid-1;}
+      const dx=K-xs[lo];
+      const iv=ys[lo]+b[lo]*dx+c[lo]*dx*dx+d[lo]*dx*dx*dx;
+      return Math.max(0.005,Math.min(4,iv));
+    }
+  };
 }
+
+// Vol surface cache per (exp, dateKey)
+const _vsCache={};
+function getVolSurface(exp, dayData, dateKey){
+  const key=`${exp}_${dateKey||'latest'}`;
+  if(!_vsCache[key]) _vsCache[key]=buildVolSurface(exp,dayData,dateKey);
+  return _vsCache[key];
+}
+function clearVolCache(){ for(const k in _vsCache) delete _vsCache[k]; }
+
+// Main IV lookup — OTM only, with spline interpolation for missing strikes
+function avgIV(exp, strike, dayData, dateKey){
+  const F=getFutPrice(exp, dateKey); if(!F) return null;
+  const T=getT(exp); if(T<=0) return null;
+  // Try direct OTM calculation first
+  const calls=dayData?.calls?.[exp]||{};
+  const puts =dayData?.puts?.[exp]||{};
+  let iv=null;
+  if(strike>F){
+    const p=calls[strike]?.price; if(p>0.005) iv=calcIV(F,strike,T,R,p,true);
+  } else if(strike<F){
+    const p=puts[strike]?.price; if(p>0.005) iv=calcIV(F,strike,T,R,p,false);
+  } else {
+    const cp=calls[strike]?.price, pp=puts[strike]?.price;
+    const civ=cp>0.005?calcIV(F,strike,T,R,cp,true):null;
+    const piv=pp>0.005?calcIV(F,strike,T,R,pp,false):null;
+    const vals=[civ,piv].filter(v=>v&&v>0.005&&v<4);
+    if(vals.length) iv=vals.reduce((a,b)=>a+b)/vals.length;
+  }
+  if(iv&&iv>0.005&&iv<4) return iv;
+  // Fallback: spline interpolation
+  const surf=getVolSurface(exp,dayData,dateKey);
+  if(surf?.eval) return surf.eval(strike);
+  if(surf?.length>=2){
+    // linear interp fallback
+    const pts=surf;
+    for(let i=0;i<pts.length-1;i++){
+      if(strike>=pts[i].K&&strike<=pts[i+1].K){
+        const t=(strike-pts[i].K)/(pts[i+1].K-pts[i].K);
+        return pts[i].iv*(1-t)+pts[i+1].iv*t;
+      }
+    }
+    if(strike<pts[0].K) return pts[0].iv;
+    return pts[pts.length-1].iv;
+  }
+  return null;
+}
+function getIV(exp,strike,isCall,dayData){ return avgIV(exp,strike,dayData); }
+function getATMIV(exp,dayData,dateStr){
+  const F=getFutPrice(exp,dateStr); if(!F) return null;
+  const surf=getVolSurface(exp,dayData,dateStr);
+  if(surf?.eval) return surf.eval(F);
+  const pts=rawOTM_IV(exp,dayData,dateStr);
+  if(!pts.length) return null;
+  const near=pts.reduce((a,b)=>Math.abs(b.K-F)<Math.abs(a.K-F)?b:a);
+  return near.iv;
+}
+// Invalidate cache when new data loaded
+function onNewDataLoaded(){ clearVolCache(); }
+
 
 // ═══════════════════ SOURCE TOGGLE ═══════════════════
 function setSource(src){
@@ -768,18 +879,21 @@ async function fetchFromGitHub(){
       } catch(e){ updateFI(f.name,'err','fetch error'); console.error(e); }
     }
 
-    // Load most recent futures PDF
-    if(futPDFs.length){
-      const latestFut = futPDFs[futPDFs.length-1];
-      setOvProg(`Parsing futures: ${latestFut.name}`);
-      addFI(latestFut.name,'load','futures');
+    // Load ALL futures PDFs (one per day for accurate per-date pricing)
+    for(const futFile of futPDFs){
+      setOvProg(`Parsing futures: ${futFile.name}`);
+      addFI(futFile.name,'load','futures');
       try{
-        const arrayBuf = await fetchGitHubPDF(latestFut.download_url);
+        const arrayBuf = await fetchGitHubPDF(futFile.download_url);
         const txt = await extractPDFText(arrayBuf);
         const prices = parseFuturesPDF(txt);
-        Object.assign(futPrices, prices);
-        updateFI(latestFut.name,'fut',`${Object.keys(prices).length} contracts`);
-      } catch(e){ updateFI(latestFut.name,'err','fetch error'); console.error(e); }
+        const dt = parseDateFromText(txt) || parseDateFromFilename(futFile.name.replace('-2',''));
+        if(dt){
+          futPricesByDate[dt] = prices;
+          Object.assign(futPrices, prices); // latest wins for display
+        }
+        updateFI(futFile.name,'fut',`${dt||'?'} · ${Object.keys(prices).length} contracts`);
+      } catch(e){ updateFI(futFile.name,'err','fetch error'); console.error(e); }
     }
 
     hideOv();
@@ -860,12 +974,13 @@ document.getElementById('fut-input').addEventListener('change',async e=>{
     addFI(f.name,'load','futures');
     try{
       const ab=await f.arrayBuffer();const txt=await extractPDFText(ab);
-      const dt=parseDateFromText(txt)||'unknown';
+      const dt=parseDateFromText(txt)||parseDateFromFilename(f.name.replace('-2',''))||'unknown';
       const prices=parseFuturesPDF(txt);
       const count=Object.keys(prices).length;
       if(count===0){updateFI(f.name,'err','no prices found');continue;}
-      // Merge into futPrices (latest file wins)
-      Object.assign(futPrices,prices);
+      // Store by date AND update latest display
+      if(dt!=='unknown') futPricesByDate[dt]=prices;
+      Object.assign(futPrices,prices); // latest wins for display
       updateFI(f.name,'fut',`${dt} · ${count} contracts`);
     }catch(err){updateFI(f.name,'err','parse error');console.error(err);}
   }
@@ -898,7 +1013,7 @@ function removeFI(id,name){
 }
 
 // ═══════════════════ DATE MANAGEMENT ═══════════════════
-function refreshDates(){
+function refreshDates(){onNewDataLoaded&&onNewDataLoaded();
   const sorted=Object.keys(days).sort();
   latestDate=sorted[sorted.length-1]||null;
   prevDate=sorted[sorted.length-2]||null;
@@ -940,10 +1055,11 @@ function getAllStrikes(dayData,exps){
   });
   return Array.from(s).sort((a,b)=>b-a);
 }
-function guessATM(dayData,exps){
+function guessATM(dayData,exps,dateStr){
   // Use futures price if available
   const nearExp=exps[0];
-  if(futPrices[nearExp])return futPrices[nearExp];
+  const F=getFutPrice(nearExp,dateStr)||futPrices[nearExp];
+  if(F)return F;
   // Otherwise highest combined OI strike
   let best=70,bestOI=0;
   const all=getAllStrikes(dayData,exps);
@@ -1260,279 +1376,230 @@ function setTab(tab,btn){
   renderMatrix();
 }
 // ═══════════════════ SENTIMENT ANALYSIS ═══════════════════
-const VOL_FILTER = 500; // minimum lots to include in sentiment
 
-function getATMIV(exp, dayData){
-  const F = futPrices[exp]; if(!F) return null;
-  const allK = new Set([...Object.keys(dayData.calls?.[exp]||{}),...Object.keys(dayData.puts?.[exp]||{})].map(Number));
-  if(!allK.size) return null;
-  const nearK = Array.from(allK).reduce((a,b)=>Math.abs(b-F)<Math.abs(a-F)?b:a);
-  return avgIV(exp, nearK, dayData);
+function getATMIV_cached(exp,dayData,dk){ return getATMIV(exp,dayData); }
+
+// ═══════════════════ SENTIMENT — FULL REWRITE ═══════════════════
+const VOL_FILTER=500;
+
+function classifyOptPVO(volToday,oiChg,side){
+  const oiUp=oiChg>50,oiDown=oiChg<-50,volHi=volToday>500;
+  if(volHi&&oiUp) return side==='call'?{s:'New Longs',c:'#3fb950'}:{s:'New Shorts',c:'#f85149'};
+  if(volHi&&oiDown) return{s:'Closing',c:'#d29922'};
+  if(!volHi&&oiUp) return{s:'Stealth',c:'#58a6ff'};
+  if(volToday>100) return{s:'Active',c:'#8b949e'};
+  return{s:'Quiet',c:'#6e7681'};
 }
 
 function renderSentiment(){
-  if(!latestDate){
-    document.getElementById('sent-master').innerHTML='<span style="color:var(--text3);font-size:10px">Load PDF files to compute sentiment.</span>';
-    return;
-  }
-  const dd = days[latestDate];
-  const prevDd = prevDate ? days[prevDate] : null;
-  const weekDd = (weekDate && weekDate !== latestDate) ? days[weekDate] : null;
-  const exps = getActiveExp(dd).filter(e=>futPrices[e]);
-  const F0 = futPrices[exps[0]] || 70;
+  const el1=document.getElementById('sent-master');
+  if(!latestDate){el1.innerHTML='<span style="color:var(--text3);font-size:10px">Load PDFs to compute sentiment.</span>';return;}
+  const sortedDates=Object.keys(days).sort();
+  const dd=days[latestDate];
+  const exps=getActiveExp(dd).filter(e=>futPrices[e]);
+  const F0=futPrices[exps[0]]||70;
 
-  // ── Per-expiry sentiment table ──
-  const rows = [];
-  exps.forEach(exp => {
-    const F = futPrices[exp]; if(!F) return;
-    const allK = new Set([...Object.keys(dd.calls?.[exp]||{}),...Object.keys(dd.puts?.[exp]||{})].map(Number));
-
-    let totalCVol=0, totalPVol=0;
-    let nosiNum=0;
-    let atmIVToday = getATMIV(exp, dd);
-    let atmIVPrev  = prevDd ? getATMIV(exp, prevDd) : null;
-    let dATMIV = (atmIVToday!=null && atmIVPrev!=null) ? (atmIVToday - atmIVPrev) : null;
-
-    // Track IV changes and volume per strike
-    let callOIUp=0, callOIFlat=0, callOIDown=0;
-    let putOIUp=0, putOIDown=0;
-    let maxCVol=0, maxCVolStrike=null, maxPVol=0, maxPVolStrike=null;
-
-    allK.forEach(K => {
-      const cRec = dd.calls?.[exp]?.[K];
-      const pRec = dd.puts?.[exp]?.[K];
-      const cVol = cRec?.vol||0;
-      const pVol = pRec?.vol||0;
-      totalCVol += cVol;
-      totalPVol += pVol;
-      if(cVol > maxCVol){maxCVol=cVol; maxCVolStrike=K;}
-      if(pVol > maxPVol){maxPVol=pVol; maxPVolStrike=K;}
-
-      // OI signal
-      const cOIChg = cRec?.oiChange||0;
-      const pOIChg = pRec?.oiChange||0;
-      if(cVol>0){ if(cOIChg>0) callOIUp++; else if(cOIChg<0) callOIDown++; else callOIFlat++; }
-      if(pVol>0){ if(pOIChg>0) putOIUp++; else putOIDown++; }
-
-      // NOSI: only strikes where total vol >= VOL_FILTER
-      if((cVol+pVol) >= VOL_FILTER && dATMIV != null && Math.abs(dATMIV) > 0.0001){
-        const ivToday = avgIV(exp,K,dd);
-        const ivPrev  = prevDd ? avgIV(exp,K,prevDd) : null;
-        if(ivToday!=null && ivPrev!=null){
-          const dIV = ivToday - ivPrev;
-          nosiNum += K * dIV * (cVol - pVol);
-        }
+  const dailyRows=[];
+  for(let i=0;i<sortedDates.length;i++){
+    const dt=sortedDates[i], d=days[dt], dPrev=i>0?days[sortedDates[i-1]]:null;
+    exps.forEach(exp=>{
+      const F=getFutPrice(exp,dt); if(!F) return;
+      const allK=new Set([...Object.keys(d.calls?.[exp]||{}),...Object.keys(d.puts?.[exp]||{})].map(Number));
+      let cVol=0,pVol=0,cOI=0,pOI=0,cOIChg=0,pOIChg=0;
+      allK.forEach(K=>{
+        const cr=d.calls?.[exp]?.[K],pr=d.puts?.[exp]?.[K];
+        cVol+=(cr?.vol||0); pVol+=(pr?.vol||0);
+        cOI+=(cr?.oi||0); pOI+=(pr?.oi||0);
+        cOIChg+=(cr?.oiChange||0); pOIChg+=(pr?.oiChange||0);
+      });
+      const ivToday=getATMIV(exp,d,dt);
+      const ivPrev=dPrev?getATMIV(exp,dPrev,sortedDates[i-1]):null;
+      const dIV=ivToday!=null&&ivPrev!=null?ivToday-ivPrev:null;
+      let nosiNum=0;
+      if(dIV!=null&&Math.abs(dIV)>0.0005){
+        allK.forEach(K=>{
+          const cr=d.calls?.[exp]?.[K],pr=d.puts?.[exp]?.[K];
+          const cv=(cr?.vol||0),pv=(pr?.vol||0);
+          if(cv+pv>=VOL_FILTER){
+            const ivK=avgIV(exp,K,d,dt);
+            const ivKp=dPrev?avgIV(exp,K,dPrev,sortedDates[i-1]):null;
+            if(ivK&&ivKp) nosiNum+=K*(ivK-ivKp)*(cv-pv);
+          }
+        });
       }
+      const nosi=dIV!=null&&Math.abs(dIV)>0.0005&&F0?(nosiNum/(F0*dIV)):null;
+      const pc=cVol>0?(pVol/cVol).toFixed(2):'—';
+      const cSig=classifyOptPVO(cVol,cOIChg,'call');
+      const pSig=classifyOptPVO(pVol,pOIChg,'put');
+      let signal='—',sigCol='#6e7681';
+      if(nosi!=null){
+        if(nosi>5){signal='Strong Bull';sigCol='#3fb950';}
+        else if(nosi>2){signal='Bullish';sigCol='#3fb950';}
+        else if(nosi<-5){signal='Strong Bear';sigCol='#f85149';}
+        else if(nosi<-2){signal='Bearish';sigCol='#f85149';}
+        else{signal='Neutral';sigCol='#6e7681';}
+      }
+      if(cVol+pVol<100) return;
+      dailyRows.push({dt,exp,cVol,pVol,cOI,pOI,cOIChg,pOIChg,ivToday,dIV,nosi,pc,cSig,pSig,signal,sigCol});
     });
+  }
 
-    const nosi = (dATMIV!=null && Math.abs(dATMIV)>0.0001 && F0)
-      ? nosiNum / (F0 * dATMIV) : null;
-    const pcRatio = totalCVol>0 ? (totalPVol/totalCVol).toFixed(2) : '—';
+  const totC=dailyRows.filter(r=>r.dt===latestDate).reduce((a,r)=>a+r.cVol,0);
+  const totP=dailyRows.filter(r=>r.dt===latestDate).reduce((a,r)=>a+r.pVol,0);
+  const bullN=dailyRows.filter(r=>r.dt===latestDate&&r.nosi!=null&&r.nosi>2).length;
+  const bearN=dailyRows.filter(r=>r.dt===latestDate&&r.nosi!=null&&r.nosi<-2).length;
+  const bias=bullN>bearN?'BULLISH':bearN>bullN?'BEARISH':'NEUTRAL';
+  const biasCol=bias==='BULLISH'?'#3fb950':bias==='BEARISH'?'#f85149':'#d29922';
+  el1.innerHTML=`
+    <div class="hs"><span class="hs-lbl">Bias (${latestDate})</span><span class="hs-val" style="color:${biasCol};font-size:15px">${bias}</span></div>
+    <div class="hs"><span class="hs-lbl">Call Vol</span><span class="hs-val c">${totC.toLocaleString()}</span></div>
+    <div class="hs"><span class="hs-lbl">Put Vol</span><span class="hs-val p">${totP.toLocaleString()}</span></div>
+    <div class="hs"><span class="hs-lbl">P/C</span><span class="hs-val">${totC>0?(totP/totC).toFixed(2):'—'}</span></div>
+    <div class="hs"><span class="hs-lbl">Bull Expiries</span><span class="hs-val g">${bullN}/${exps.length}</span></div>
+    <div class="hs"><span class="hs-lbl">Bear Expiries</span><span class="hs-val p">${bearN}/${exps.length}</span></div>`;
 
-    // Call skew: is call-side IV > put-side IV? (above ATM calls vs below ATM puts)
-    let callSkewPts=[], putSkewPts=[];
-    allK.forEach(K=>{
-      const iv = avgIV(exp,K,dd); if(!iv) return;
-      if(K > F) callSkewPts.push(iv);
-      if(K < F) putSkewPts.push(iv);
-    });
-    const avgCallSkew = callSkewPts.length ? callSkewPts.reduce((a,b)=>a+b)/callSkewPts.length : null;
-    const avgPutSkew  = putSkewPts.length  ? putSkewPts.reduce((a,b)=>a+b)/putSkewPts.length  : null;
-    const skewBias = (avgCallSkew&&avgPutSkew) ? avgCallSkew - avgPutSkew : null;
-
-    rows.push({exp, totalCVol, totalPVol, pcRatio, nosi, dATMIV,
-      atmIVToday, skewBias, maxCVol, maxCVolStrike, maxPVol, maxPVolStrike,
-      callOIUp, callOIDown, putOIUp, putOIDown});
-  });
-
-  // Header
   document.getElementById('sent-thead').innerHTML=`<tr>
-    <th style="color:var(--atm)">Expiry</th>
-    <th style="color:var(--call)">Call Vol</th>
-    <th style="color:var(--put)">Put Vol</th>
-    <th>P/C Ratio</th>
-    <th style="color:var(--atm)">ATM IV</th>
-    <th>ΔIV (1D)</th>
-    <th>Call Skew</th>
-    <th style="color:var(--text2)">Skew Signal</th>
-    <th style="color:var(--atm)">NOSI</th>
-    <th>Signal</th>
-    <th>Top Call Strike</th>
-    <th>Top Put Strike</th>
-  </tr>`;
+    <th style="color:var(--text3)">Date</th><th style="color:var(--atm)">Expiry</th>
+    <th style="color:var(--call)">C Vol</th><th style="color:var(--call)">C OI Δ</th><th style="color:var(--call)">C Sig</th>
+    <th style="color:var(--put)">P Vol</th><th style="color:var(--put)">P OI Δ</th><th style="color:var(--put)">P Sig</th>
+    <th>P/C</th><th style="color:var(--atm)">ATM IV</th><th>ΔIV 1D</th>
+    <th style="color:var(--atm)">NOSI</th><th>Signal</th></tr>`;
 
-  document.getElementById('sent-tbody').innerHTML = rows.map(r=>{
-    const nosiStr = r.nosi!=null ? r.nosi.toFixed(1) : '—';
-    const nosiCol = r.nosi==null?'zero':r.nosi>2?'pos':r.nosi<-2?'neg':'var(--text2)';
-    const nosiSignal = r.nosi==null?'—':r.nosi>5?'Strong Bullish':r.nosi>2?'Bullish':r.nosi>-2?'Neutral':r.nosi>-5?'Bearish':'Strong Bearish';
-    const nosiSignalCol = r.nosi==null?'zero':Math.abs(r.nosi)>2?(r.nosi>0?'pos':'neg'):'zero';
-    const dIVStr = r.dATMIV!=null?(r.dATMIV>0?'+':'')+(r.dATMIV*100).toFixed(1)+'pp':'—';
-    const dIVCol = r.dATMIV==null?'zero':r.dATMIV>0.002?'neg':r.dATMIV<-0.002?'pos':'zero';
-    const skewStr = r.skewBias!=null?(r.skewBias>0?'+':'')+(r.skewBias*100).toFixed(1)+'pp':'—';
-    const skewSignal = r.skewBias==null?'—':r.skewBias>0.005?'Call bid (bullish)':r.skewBias<-0.005?'Put bid (bearish)':'Neutral';
-    const skewCol = r.skewBias==null?'zero':r.skewBias>0.005?'pos':r.skewBias<-0.005?'neg':'zero';
-    const atmStr = r.atmIVToday!=null?(r.atmIVToday*100).toFixed(1)+'%':'—';
-    return`<tr>
-      <td style="color:var(--atm);font-weight:700">${EXP_LBL[r.exp]||r.exp}</td>
-      <td style="color:var(--call)">${r.totalCVol.toLocaleString()}</td>
-      <td style="color:var(--put)">${r.totalPVol.toLocaleString()}</td>
-      <td>${r.pcRatio}</td>
-      <td>${atmStr}</td>
-      <td class="${dIVCol}">${dIVStr}</td>
-      <td class="${skewCol}">${skewStr}</td>
-      <td class="${skewCol}">${skewSignal}</td>
-      <td class="${nosiCol}" style="font-weight:700">${nosiStr}</td>
-      <td class="${nosiSignalCol}">${nosiSignal}</td>
-      <td style="color:var(--call)">${r.maxCVolStrike||'—'} (${r.maxCVol.toLocaleString()})</td>
-      <td style="color:var(--put)">${r.maxPVolStrike||'—'} (${r.maxPVol.toLocaleString()})</td>
-    </tr>`;
+  let lastDt2='';
+  const rowsDesc=[...dailyRows].sort((a,b)=>b.dt.localeCompare(a.dt)||a.exp.localeCompare(b.exp));
+  document.getElementById('sent-tbody').innerHTML=rowsDesc.map(r=>{
+    const isNew=r.dt!==lastDt2; lastDt2=r.dt;
+    const dtCell=isNew?`<td style="color:var(--atm);font-weight:700;white-space:nowrap">${r.dt}</td>`:'<td></td>';
+    const ivStr=r.ivToday!=null?(r.ivToday*100).toFixed(1)+'%':'—';
+    const dIVStr=r.dIV!=null?(r.dIV>0?'+':'')+(r.dIV*100).toFixed(1)+'pp':'—';
+    const dIVCol=r.dIV==null?'#6e7681':r.dIV>0.002?'#f85149':r.dIV<-0.002?'#3fb950':'#6e7681';
+    const nosiStr=r.nosi!=null?r.nosi.toFixed(1):'—';
+    const nosiCol=r.nosi==null?'#6e7681':r.nosi>2?'#3fb950':r.nosi<-2?'#f85149':'#6e7681';
+    return`<tr${isNew?' style="border-top:0.5px solid var(--border2)"':''}>
+      ${dtCell}<td style="color:var(--atm)">${EXP_LBL[r.exp]||r.exp}</td>
+      <td style="color:var(--call)">${r.cVol.toLocaleString()}</td>
+      <td style="color:${r.cOIChg>0?'#3fb950':r.cOIChg<0?'#f85149':'#6e7681'}">${(r.cOIChg>0?'+':'')+r.cOIChg.toLocaleString()}</td>
+      <td style="color:${r.cSig.c}">${r.cSig.s}</td>
+      <td style="color:var(--put)">${r.pVol.toLocaleString()}</td>
+      <td style="color:${r.pOIChg>0?'#f85149':r.pOIChg<0?'#3fb950':'#6e7681'}">${(r.pOIChg>0?'+':'')+r.pOIChg.toLocaleString()}</td>
+      <td style="color:${r.pSig.c}">${r.pSig.s}</td>
+      <td>${r.pc}</td><td style="color:var(--atm)">${ivStr}</td>
+      <td style="color:${dIVCol}">${dIVStr}</td>
+      <td style="color:${nosiCol};font-weight:700">${nosiStr}</td>
+      <td style="color:${r.sigCol};font-weight:600">${r.signal}</td></tr>`;
   }).join('');
 
-  // ── Master indicator ──
-  const totalC = rows.reduce((a,r)=>a+r.totalCVol,0);
-  const totalP = rows.reduce((a,r)=>a+r.totalPVol,0);
-  const bullishExps = rows.filter(r=>r.nosi!=null&&r.nosi>2).length;
-  const bearishExps = rows.filter(r=>r.nosi!=null&&r.nosi<-2).length;
-  const overallPC = totalC>0?(totalP/totalC).toFixed(2):'—';
-  const masterBias = bullishExps > bearishExps ? 'BULLISH' : bearishExps > bullishExps ? 'BEARISH' : 'NEUTRAL';
-  const masterCol = masterBias==='BULLISH'?'var(--pos)':masterBias==='BEARISH'?'var(--neg)':'var(--atm)';
-  document.getElementById('sent-master').innerHTML=`
-    <div class="hs"><span class="hs-lbl">Overall Bias</span><span class="hs-val" style="color:${masterCol};font-size:16px">${masterBias}</span></div>
-    <div class="hs"><span class="hs-lbl">Total Call Vol</span><span class="hs-val c">${totalC.toLocaleString()}</span></div>
-    <div class="hs"><span class="hs-lbl">Total Put Vol</span><span class="hs-val p">${totalP.toLocaleString()}</span></div>
-    <div class="hs"><span class="hs-lbl">Overall P/C</span><span class="hs-val">${overallPC}</span></div>
-    <div class="hs"><span class="hs-lbl">Bullish Expiries</span><span class="hs-val g">${bullishExps} / ${rows.length}</span></div>
-    <div class="hs"><span class="hs-lbl">Bearish Expiries</span><span class="hs-val p">${bearishExps} / ${rows.length}</span></div>
-    <div class="hs"><span class="hs-lbl">Latest Date</span><span class="hs-val a">${latestDate||'—'}</span></div>
-  `;
-
-  // ── Price/Volume/OI signals ──
-  renderPVO('pvo-1d', dd, prevDd, '1D');
-  renderPVO('pvo-wk', dd, weekDd, 'Weekly');
-
-  // ── Narrative summary ──
-  renderNarrative(rows, dd, prevDd, weekDd, F0);
-
-  setSB(`Sentiment · ${rows.length} expiries analysed · Overall: ${masterBias} · NOSI >500-lot filter applied`);
+  renderPVO('pvo-1d',dd,latestDate,sortedDates,exps,'1D');
+  renderPVO('pvo-wk',dd,latestDate,sortedDates,exps,'Weekly');
+  renderNarrative(dailyRows,exps,sortedDates,F0);
+  setSB(`Sentiment · ${exps.length} expiries · ${sortedDates.length} day(s) · Bias: ${bias}`);
 }
 
-function renderPVO(elId, todayDd, prevDd, label){
-  const el = document.getElementById(elId);
-  if(!prevDd){el.innerHTML=`<span style="color:var(--text3)">Load ${label==='1D'?'2':'7+'} days of PDFs to see ${label} signals.</span>`;return;}
-  const exps = getActiveExp(todayDd).filter(e=>futPrices[e]);
-  let html='<table style="width:100%;font-size:9px;border-collapse:collapse">';
-  html+=`<tr><th style="text-align:left;padding:3px 6px;color:var(--text3);font-size:7px;border:0.5px solid var(--border)">Expiry</th><th style="padding:3px 6px;color:var(--call);border:0.5px solid var(--border)">Call Signal</th><th style="padding:3px 6px;color:var(--put);border:0.5px solid var(--border)">Put Signal</th><th style="padding:3px 6px;border:0.5px solid var(--border)">Interpretation</th></tr>`;
-
+function renderPVO(elId,todayDd,latestDt,sortedDates,exps,mode){
+  const el=document.getElementById(elId);
+  const prevDt=mode==='1D'?(sortedDates[sortedDates.indexOf(latestDt)-1]||null):(sortedDates[0]!==latestDt?sortedDates[0]:null);
+  const prevDd=prevDt?days[prevDt]:null;
+  if(!prevDd){el.innerHTML=`<span style="color:var(--text3);font-size:9px">Need ≥2 files for ${mode} analysis.</span>`;return;}
+  let html=`<div style="font-size:8px;color:var(--text3);margin-bottom:5px">${mode==='1D'?latestDt+' vs '+prevDt:sortedDates[0]+' → '+latestDt}</div>`;
+  html+='<table style="width:100%;font-size:9px;border-collapse:collapse"><tr>';
+  ['Expiry','F','Call V/ΔOI','Put V/ΔOI','ΔIV','Interpretation'].forEach(h=>
+    html+=`<th style="padding:2px 5px;border:0.5px solid var(--border);font-size:7px;color:var(--text3)">${h}</th>`);
+  html+='</tr>';
   exps.forEach(exp=>{
-    const F = futPrices[exp];
-    const allK = new Set([...Object.keys(todayDd.calls?.[exp]||{}),...Object.keys(todayDd.puts?.[exp]||{})].map(Number));
-
-    // Aggregate across strikes
-    let cVolToday=0,pVolToday=0,cOIToday=0,pOIToday=0,cOIPrev=0,pOIPrev=0;
+    const F=futPrices[exp]; if(!F) return;
+    const allK=new Set([...Object.keys(todayDd.calls?.[exp]||{}),...Object.keys(todayDd.puts?.[exp]||{})].map(Number));
+    let cVol=0,pVol=0,cOI=0,pOI=0,cOIPrev=0,pOIPrev=0;
     allK.forEach(K=>{
-      const ct=todayDd.calls?.[exp]?.[K]; const pt=todayDd.puts?.[exp]?.[K];
-      const cp=prevDd.calls?.[exp]?.[K]; const pp=prevDd.puts?.[exp]?.[K];
-      cVolToday+=(ct?.vol||0); pVolToday+=(pt?.vol||0);
-      cOIToday+=(ct?.oi||0); pOIToday+=(pt?.oi||0);
+      const ct=todayDd.calls?.[exp]?.[K],pt=todayDd.puts?.[exp]?.[K];
+      const cp=prevDd.calls?.[exp]?.[K],pp=prevDd.puts?.[exp]?.[K];
+      cVol+=(ct?.vol||0); pVol+=(pt?.vol||0);
+      cOI+=(ct?.oi||0); pOI+=(pt?.oi||0);
       cOIPrev+=(cp?.oi||0); pOIPrev+=(pp?.oi||0);
     });
-
-    const cVolPrev = Object.values(prevDd.calls?.[exp]||{}).reduce((a,r)=>a+(r.vol||0),0);
-    const pVolPrev = Object.values(prevDd.puts?.[exp]||{}).reduce((a,r)=>a+(r.vol||0),0);
-    const cOIChg = cOIToday - cOIPrev;
-    const pOIChg = pOIToday - pOIPrev;
-    const cVolChg = cVolToday - cVolPrev;
-
-    // Classify
-    function classifyOIVol(vol, oiChg, side){
-      const volUp=vol>0, oiUp=oiChg>0;
-      if(volUp&&oiUp) return side==='call'?{txt:'Vol↑ OI↑',col:'var(--pos)',note:'New longs entering'}:{txt:'Vol↑ OI↑',col:'var(--neg)',note:'New shorts entering'};
-      if(volUp&&!oiUp) return {txt:'Vol↑ OI↓',col:'var(--amber)',note:'Position transfer/closing'};
-      if(!volUp&&oiUp) return {txt:'Vol↓ OI↑',col:'var(--text2)',note:'Stealth build-up'};
-      return {txt:'Low activity',col:'var(--text3)',note:'—'};
-    }
-    const cs = classifyOIVol(cVolToday,cOIChg,'call');
-    const ps = classifyOIVol(pVolToday,pOIChg,'put');
-
-    // Overall interpretation
-    const atmIVToday = getATMIV(exp,todayDd);
-    const atmIVPrev  = getATMIV(exp,prevDd);
-    const ivUp = atmIVToday!=null&&atmIVPrev!=null&&atmIVToday>atmIVPrev;
-    const ivDown = atmIVToday!=null&&atmIVPrev!=null&&atmIVToday<atmIVPrev;
-    let interp='—', interpCol='var(--text3)';
-    if(cOIChg>0&&cVolToday>pVolToday&&ivUp){interp='Bullish — calls added, vol bid';interpCol='var(--pos)';}
-    else if(cOIChg>0&&cVolToday>pVolToday&&ivDown){interp='Muted bullish — calls added, vol soft';interpCol='var(--text2)';}
-    else if(pOIChg>0&&pVolToday>cVolToday&&ivUp){interp='Bearish — puts added, vol bid';interpCol='var(--neg)';}
-    else if(pOIChg>0&&pVolToday>cVolToday&&ivDown){interp='Muted bearish — puts added, vol soft';interpCol='var(--text2)';}
-    else if(cOIChg<0&&ivDown){interp='Calls sold, vol collapsing — not bullish';interpCol='var(--neg)';}
-    else if(pOIChg<0&&ivDown){interp='Puts sold, vol collapsing — not bearish';interpCol='var(--pos)';}
-    else if(cVolToday>500||pVolToday>500){interp='Position transfers — watch OI';interpCol='var(--amber)';}
-
-    if(cVolToday<200&&pVolToday<200)return; // skip illiquid expiries
-    html+=`<tr>
-      <td style="padding:3px 6px;color:var(--atm);font-weight:700;border:0.5px solid var(--border)">${EXP_LBL[exp]||exp}</td>
-      <td style="padding:3px 6px;color:${cs.col};border:0.5px solid var(--border)">${cs.txt}<br><span style="color:var(--text3);font-size:7px">${cs.note}</span></td>
-      <td style="padding:3px 6px;color:${ps.col};border:0.5px solid var(--border)">${ps.txt}<br><span style="color:var(--text3);font-size:7px">${ps.note}</span></td>
-      <td style="padding:3px 6px;color:${interpCol};border:0.5px solid var(--border);font-weight:${interp!=='—'?'600':'400'}">${interp}</td>
-    </tr>`;
+    if(cVol+pVol<100) return;
+    const cOIChg=cOI-cOIPrev,pOIChg=pOI-pOIPrev;
+    const ivT=getATMIV(exp,todayDd,latestDt),ivP=getATMIV(exp,prevDd,prevDt);
+    const dIV=ivT&&ivP?ivT-ivP:null;
+    const ivStr=dIV!=null?(dIV>0?'+':'')+(dIV*100).toFixed(1)+'pp':'—';
+    const ivCol=dIV==null?'#6e7681':dIV>0.002?'#f85149':dIV<-0.002?'#3fb950':'#6e7681';
+    const cNew=cVol>200&&cOIChg>0,cClose=cVol>200&&cOIChg<0;
+    const pNew=pVol>200&&pOIChg>0;
+    const ivUp=dIV!=null&&dIV>0.002,ivDown=dIV!=null&&dIV<-0.002;
+    let interp='—',ic='#6e7681';
+    if(cNew&&ivUp&&!pNew){interp='Bullish — call longs + vol bid';ic='#3fb950';}
+    else if(cNew&&ivDown){interp='Covered calls — vol sold';ic='#d29922';}
+    else if(pNew&&ivUp&&!cNew){interp='Bearish — put longs + vol bid';ic='#f85149';}
+    else if(pNew&&ivDown){interp='Put selling — not bearish';ic='#d29922';}
+    else if(cClose&&ivDown){interp='Vol collapse — not bullish';ic='#d29922';}
+    else if(cNew&&pNew&&ivUp){interp='Straddle buy — vol play';ic='#bc8cff';}
+    else if(cVol>pVol*2&&cOIChg<0){interp='Call transfer — not directional';ic='#8b949e';}
+    else if(pVol>cVol*2&&pOIChg<0){interp='Put transfer — not directional';ic='#8b949e';}
+    else{interp='Mixed signals';ic='#6e7681';}
+    html+=`<tr><td style="padding:2px 5px;color:var(--atm);font-weight:700;border:0.5px solid var(--border)">${EXP_LBL[exp]||exp}</td>
+      <td style="padding:2px 5px;border:0.5px solid var(--border)">${F.toFixed(2)}</td>
+      <td style="padding:2px 5px;color:var(--call);border:0.5px solid var(--border)">${cVol.toLocaleString()} / ${cOIChg>=0?'+':''}${cOIChg.toLocaleString()}</td>
+      <td style="padding:2px 5px;color:var(--put);border:0.5px solid var(--border)">${pVol.toLocaleString()} / ${pOIChg>=0?'+':''}${pOIChg.toLocaleString()}</td>
+      <td style="padding:2px 5px;color:${ivCol};border:0.5px solid var(--border)">${ivStr}</td>
+      <td style="padding:2px 5px;color:${ic};border:0.5px solid var(--border)">${interp}</td></tr>`;
   });
-  html+='</table>';
-  el.innerHTML=html;
+  el.innerHTML=html+'</table>';
 }
 
-function renderNarrative(rows, dd, prevDd, weekDd, F0){
+function renderNarrative(dailyRows,exps,sortedDates,F0){
   const el=document.getElementById('sent-narrative');
-  const exps=rows.map(r=>r.exp);
+  const n=sortedDates.length;
+  if(n<2){el.innerHTML='<span style="color:var(--text3)">Load ≥2 days of PDFs for narrative analysis.</span>';return;}
+  const firstDt=sortedDates[0],lastDt=sortedDates[n-1];
   const lines=[];
-  const dateRange = weekDd?`${weekDate} → ${latestDate}`:`${latestDate} (single day)`;
+  lines.push(`<b>Week in Review: ${firstDt} → ${lastDt} (${n} trading days)</b>`);
+  const wkC=dailyRows.reduce((a,r)=>a+r.cVol,0),wkP=dailyRows.reduce((a,r)=>a+r.pVol,0);
+  const pcW=wkC>0?(wkP/wkC).toFixed(2):'—';
+  const pcLean=parseFloat(pcW)<0.6?'<span style="color:#3fb950">call-dominant — bullish lean</span>':parseFloat(pcW)>1.1?'<span style="color:#f85149">put-heavy — bearish lean</span>':'<span style="color:#8b949e">balanced</span>';
+  lines.push(`Week total: <span style="color:var(--call)">${wkC.toLocaleString()} calls</span> · <span style="color:var(--put)">${wkP.toLocaleString()} puts</span> · P/C ${pcW} — ${pcLean}`);
 
-  // Overall volume summary
-  const totalC=rows.reduce((a,r)=>a+r.totalCVol,0);
-  const totalP=rows.reduce((a,r)=>a+r.totalPVol,0);
-  const pc=(totalC>0?(totalP/totalC).toFixed(2):'—');
-  lines.push(`<b>Period: ${dateRange}</b>`);
-  lines.push(`Total calls traded: <span style="color:var(--call)">${totalC.toLocaleString()}</span> · Total puts: <span style="color:var(--put)">${totalP.toLocaleString()}</span> · P/C ratio: <b>${pc}</b> ${parseFloat(pc)<0.5?'<span style="color:var(--pos)">(strong call dominance — bullish lean)</span>':parseFloat(pc)>1.2?'<span style="color:var(--neg)">(put heavy — bearish lean)</span>':'<span style="color:var(--text3)">(balanced)</span>'}`);
-
-  // Top volume strikes across all expiries
-  let topCVol=0,topCStrike=null,topCExp=null,topPVol=0,topPStrike=null,topPExp=null;
-  rows.forEach(r=>{if(r.maxCVol>topCVol){topCVol=r.maxCVol;topCStrike=r.maxCVolStrike;topCExp=r.exp;}});
-  rows.forEach(r=>{if(r.maxPVol>topPVol){topPVol=r.maxPVol;topPStrike=r.maxPVolStrike;topPExp=r.exp;}});
-  if(topCStrike) lines.push(`Highest call volume: <span style="color:var(--call)">${EXP_LBL[topCExp]||topCExp} ${topCStrike}C — ${topCVol.toLocaleString()} lots</span>`);
-  if(topPStrike) lines.push(`Highest put volume: <span style="color:var(--put)">${EXP_LBL[topPExp]||topPExp} ${topPStrike}P — ${topPVol.toLocaleString()} lots</span>`);
-
-  // IV commentary per expiry
-  rows.forEach(r=>{
-    if(r.totalCVol<200&&r.totalPVol<200) return;
-    const exp=EXP_LBL[r.exp]||r.exp;
-    const atmStr=r.atmIVToday!=null?(r.atmIVToday*100).toFixed(1)+'%':'?';
-    const dStr=r.dATMIV!=null?` (${r.dATMIV>0?'+':''}${(r.dATMIV*100).toFixed(1)}pp 1D)`:'';
-    let comment='';
-    if(r.nosi!=null){
-      if(r.nosi>5) comment='<span style="color:var(--pos)">Strong bullish signal — calls dominant with vol bid</span>';
-      else if(r.nosi>2) comment='<span style="color:var(--pos)">Bullish lean</span>';
-      else if(r.nosi<-5) comment='<span style="color:var(--neg)">Strong bearish signal — puts dominant with vol bid</span>';
-      else if(r.nosi<-2) comment='<span style="color:var(--neg)">Bearish lean</span>';
-      else comment='<span style="color:var(--text3)">Neutral / mixed signals</span>';
+  const liquidExps=exps.filter(exp=>dailyRows.filter(r=>r.exp===exp).reduce((a,r)=>a+r.cVol+r.pVol,0)>300);
+  liquidExps.forEach(exp=>{
+    const rows=dailyRows.filter(r=>r.exp===exp).sort((a,b)=>a.dt.localeCompare(b.dt));
+    if(!rows.length) return;
+    const first=rows[0],last=rows[rows.length-1];
+    const expC=rows.reduce((a,r)=>a+r.cVol,0),expP=rows.reduce((a,r)=>a+r.pVol,0);
+    const bullD=rows.filter(r=>r.nosi!=null&&r.nosi>2).length;
+    const bearD=rows.filter(r=>r.nosi!=null&&r.nosi<-2).length;
+    let ivTrend='';
+    if(first.ivToday&&last.ivToday){
+      const d=(last.ivToday-first.ivToday)*100;
+      ivTrend=d>1?`vol +${d.toFixed(1)}pp`:d<-1?`vol ${d.toFixed(1)}pp`:`vol stable ~${(last.ivToday*100).toFixed(1)}%`;
     }
-    if(r.skewBias!=null&&Math.abs(r.skewBias)>0.005){
-      comment+= r.skewBias>0
-        ? ' · <span style="color:var(--pos)">Call skew bid — market pricing upside</span>'
-        : ' · <span style="color:var(--neg)">Put skew bid — market pricing downside protection</span>';
-    }
-    if(r.dATMIV!=null&&r.totalCVol>500&&r.totalCVol>r.totalPVol&&r.dATMIV<-0.003){
-      comment+=' · <span style="color:var(--neg)">Vol collapsed despite call flow — bearish signal</span>';
-    }
-    if(comment) lines.push(`${exp}: ATM IV ${atmStr}${dStr} — ${comment}`);
+    const latestD=days[lastDt];
+    const F=futPrices[exp];
+    const allK=new Set([...Object.keys(latestD.calls?.[exp]||{}),...Object.keys(latestD.puts?.[exp]||{})].map(Number));
+    let upIV=[],dnIV=[];
+    allK.forEach(K=>{const iv=avgIV(exp,K,latestD,lastDt);if(iv){if(K>F+1)upIV.push(iv);else if(K<F-1)dnIV.push(iv);}});
+    const avgUp=upIV.length?upIV.reduce((a,b)=>a+b)/upIV.length:null; // IV already uses dateKey
+    const avgDn=dnIV.length?dnIV.reduce((a,b)=>a+b)/dnIV.length:null;
+    let skewC='';
+    if(avgUp&&avgDn){const sk=(avgUp-avgDn)*100;skewC=sk>1.5?` · <span style="color:#3fb950">call skew bid +${sk.toFixed(1)}pp</span>`:sk<-1.5?` · <span style="color:#f85149">put skew bid ${sk.toFixed(1)}pp</span>`:' · skew flat';}
+    const wkBias=bullD>bearD?'Bullish':bearD>bullD?'Bearish':'Neutral';
+    const wkBiasCol=wkBias==='Bullish'?'#3fb950':wkBias==='Bearish'?'#f85149':'#8b949e';
+    lines.push(`<b style="color:var(--atm)">${EXP_LBL[exp]||exp}</b>: ${expC.toLocaleString()}C/${expP.toLocaleString()}P · ${ivTrend||'—'}${skewC} · <b style="color:${wkBiasCol}">${wkBias}</b> (${bullD} bull / ${bearD} bear days)`);
   });
-
-  if(lines.length<=2) lines.push('<span style="color:var(--text3)">Load multiple days of PDFs for detailed analysis.</span>');
-  el.innerHTML = lines.map(l=>`<div style="padding:2px 0;border-bottom:0.5px solid var(--border)">${l}</div>`).join('');
+  lines.push('');
+  const allBull=dailyRows.filter(r=>r.dt===lastDt&&r.nosi!=null&&r.nosi>2).length;
+  const allBear=dailyRows.filter(r=>r.dt===lastDt&&r.nosi!=null&&r.nosi<-2).length;
+  const conclusion=allBull>allBear
+    ?`<span style="color:#3fb950"><b>Conclusion:</b> Options market positioned bullishly. Call flow dominant with constructive OI. If vol expands on price rally — confirmed move. If vol collapses on rally — sellers fading, caution warranted.</span>`
+    :allBear>allBull
+    ?`<span style="color:#f85149"><b>Conclusion:</b> Defensive positioning — put flow and OI signal hedging/shorts. Vol bid on puts confirms fear. Watch for vol crush as signal of short-covering reversal.</span>`
+    :`<span style="color:#8b949e"><b>Conclusion:</b> Mixed signals, no directional conviction. Market in consolidation. Monitor for vol breakout or OI surge on one side as directional cue.</span>`;
+  lines.push(conclusion);
+  el.innerHTML=lines.filter(Boolean).map(l=>`<div style="padding:3px 0;border-bottom:0.5px solid var(--border);line-height:1.7">${l}</div>`).join('');
 }
 
 function showOv(msg){document.getElementById('ov').classList.add('on');document.getElementById('ov-txt').textContent=msg;document.getElementById('ov-prog').textContent='';}
 function setOvProg(msg){document.getElementById('ov-prog').textContent=msg;}
 function hideOv(){document.getElementById('ov').classList.remove('on');}
 function setSB(msg){document.getElementById('sb').textContent=msg;}
+
 
 // ═══════════════════ BLACK-76 GREEKS ═══════════════════
 function b76Greeks(F,K,T,r,σ,isCall){
