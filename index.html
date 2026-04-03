@@ -1892,17 +1892,20 @@ function renderGreeks(){
   sortedSt.forEach(K=>{
     const isATM=Math.abs(K-atm)<0.5;
     const cRec=dd.calls?.[exp]?.[K]; const pRec=dd.puts?.[exp]?.[K];
-    const iv=avgIV(exp,K,dd);
+    const iv=avgIV(exp,K,dd,latestDate);
     const cG=iv?b76Greeks(F,K,T,R,iv,true):null;
     const pG=iv?b76Greeks(F,K,T,R,iv,false):null;
+    // Use theoretical B76 price for synthetic strikes (no market price in PDF)
+    const cPrice=cRec?.price>0.005?cRec.price:(cG?.price||null);
+    const pPrice=pRec?.price>0.005?pRec.price:(pG?.price||null);
     const ivStr=iv?`<span class="iv-${iv*100>30?'r':iv*100>22?'a':'g'}">${(iv*100).toFixed(1)}%</span>`:'<span class="zero">—</span>';
     const f3=v=>v!=null?v.toFixed(3):'—';
     const f5=v=>v!=null?v.toFixed(5):'—';
     const f4=v=>v!=null?v.toFixed(4):'—';
     h+=`<tr${isATM?' class="atm"':''}><td class="sk">${K}${isATM?'<span class="atm-tag">ATM</span>':''}</td>`;
     if(grkSide!=='puts'){
-      const cp=cRec?.price; const coi=cRec?.oi||0;
-      h+=`<td style="color:var(--text2)">${cp?cp.toFixed(2):'—'}</td>`;
+      const coi=cRec?.oi||0;
+      h+=`<td style="color:var(--text2)${!cRec?.price?';opacity:0.55':''}">${cPrice!=null?cPrice.toFixed(2):'—'}</td>`;
       h+=`<td style="color:var(--call)">${coi?coi.toLocaleString():'—'}</td>`;
       h+=`<td>${ivStr}</td>`;
       if(cG){
@@ -1914,8 +1917,8 @@ function renderGreeks(){
     }
     h+='<td style="background:var(--bg3);min-width:6px"></td>';
     if(grkSide!=='calls'){
-      const pp=pRec?.price; const poi=pRec?.oi||0;
-      h+=`<td style="color:var(--text2)">${pp?pp.toFixed(2):'—'}</td>`;
+      const poi=pRec?.oi||0;
+      h+=`<td style="color:var(--text2)${!pRec?.price?';opacity:0.55':''}">${pPrice!=null?pPrice.toFixed(2):'—'}</td>`;
       h+=`<td style="color:var(--put)">${poi?poi.toLocaleString():'—'}</td>`;
       h+=`<td>${ivStr}</td>`;
       if(pG){
@@ -2011,28 +2014,27 @@ let vsExpChecks={}; // exp -> bool
 // colour palette per expiry (10 colours, cycles)
 const VS_COLORS=['#58a6ff','#f0b429','#3fb950','#f85149','#bc8cff','#f4a261','#26c6da','#ff7c7c','#a8ff78','#ffb347'];
 
-function getSmileData(dayData, exp, side){
-  // Returns [{strike, iv, delta, x}] using avgIV (put-call parity)
-  if(!dayData||!futPrices[exp])return[];
-  const F=getFutPrice(exp,latestDate)||futPrices[exp], T=getT(exp,latestDate);
-  // Collect all strikes that have any data on either side
-  const allK=new Set([
-    ...Object.keys(dayData.calls?.[exp]||{}),
-    ...Object.keys(dayData.puts?.[exp]||{})
-  ].map(Number));
+function getSmileData(dayData, exp, side, dateStr){
+  // dateStr MUST be passed so prev/week data uses their own futures price and T
+  const dk=dateStr||latestDate;
+  const F=getFutPrice(exp,dk)||futPrices[exp]; if(!dayData||!F)return[];
+  const T=getT(exp,dk); if(T<=0)return[];
+  const marketK=new Set([...Object.keys(dayData.calls?.[exp]||{}),...Object.keys(dayData.puts?.[exp]||{})].map(Number));
+  const allK=new Set([...marketK]);
+  for(let dK=-20;dK<=20;dK++) allK.add(Math.round(F)+dK);
   const pts=[];
   for(const K of allK){
-    const iv=avgIV(exp,K,dayData);
+    const iv=avgIV(exp,K,dayData,dk);
     if(!iv||iv<0.01||iv>3)continue;
-    // Use call delta as reference (side param now just used for filtering display)
     const isCall=side==='calls'||side==='both';
     const grk=b76Greeks(F,K,T,R,iv,isCall);
-    // Only include if the requested side has price data
-    const hasCall=dayData.calls?.[exp]?.[K]?.price>0.005;
-    const hasPut=dayData.puts?.[exp]?.[K]?.price>0.005;
-    if(side==='calls'&&!hasCall)continue;
-    if(side==='puts'&&!hasPut)continue;
-    if(side==='both'&&!hasCall&&!hasPut)continue;
+    if(marketK.has(K)){
+      const hasCall=dayData.calls?.[exp]?.[K]?.price>0.005;
+      const hasPut=dayData.puts?.[exp]?.[K]?.price>0.005;
+      if(side==='calls'&&!hasCall)continue;
+      if(side==='puts'&&!hasPut)continue;
+      if(side==='both'&&!hasCall&&!hasPut)continue;
+    }
     pts.push({strike:K, iv:iv*100, delta:Math.abs(grk.delta), x:vsXAxis==='delta'?Math.abs(grk.delta):K});
   }
   return pts.sort((a,b)=>a.strike-b.strike);
@@ -2096,7 +2098,7 @@ function renderVolSmile(){
     const F=futPrices[e];
     const sides=vsCallSide==='both'?['calls','puts']:[vsCallSide];
     sides.forEach(side=>{
-      const pts=getSmileData(dd,e,side);
+      const pts=getSmileData(dd,e,side,latestDate);
       if(!pts.length)return;
       // filter by strike range
       const filtered=vsXAxis==='delta'?pts:pts.filter(p=>Math.abs(p.strike-F)<=rangeLimit);
@@ -2143,8 +2145,8 @@ function renderVolSmile(){
       const F=futPrices[e]; if(!F)return;
       const sides=vsCallSide==='both'?['calls','puts']:[vsCallSide];
       sides.forEach(side=>{
-        const today=getSmileData(dd,e,side);
-        const prev=getSmileData(prevDd,e,side);
+        const today=getSmileData(dd,e,side,latestDate);
+        const prev=getSmileData(prevDd,e,side,prevDate);
         if(!today.length||!prev.length)return;
         const prevMap=new Map(prev.map(p=>[p.strike,p.iv]));
         const chgPts=today
@@ -2189,8 +2191,8 @@ function renderVolSmile(){
       const F=futPrices[e]; if(!F)return;
       const sides=vsCallSide==='both'?['calls','puts']:[vsCallSide];
       sides.forEach(side=>{
-        const today=getSmileData(dd,e,side);
-        const wk=getSmileData(weekDd,e,side);
+        const today=getSmileData(dd,e,side,latestDate);
+        const wk=getSmileData(weekDd,e,side,weekDate);
         if(!today.length||!wk.length)return;
         const wkMap=new Map(wk.map(p=>[p.strike,p.iv]));
         const chgPts=today
