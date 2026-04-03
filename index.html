@@ -969,36 +969,74 @@ function interpolateMissingF(prices){ return prices; }
 // ═══════════════════ FUTURES PDF PARSER ═══════════════════
 function parseFuturesPDF(txt){
   const prices={};
-  // Pattern: CT May-26 70.00 70.88 68.60 70.70 70.76 0.76 ...
-  // or simpler: CT May-26 ... 70.76 (settle is 5th number typically)
+  const fpfx=getComm().futuresPrefix;
   const lines=txt.split('\n');
   for(const line of lines){
-    // Match "CT May-26" or "CT Jul-26" etc.
-    const fpfx=getComm().futuresPrefix;
-    const m=line.match(new RegExp(`${fpfx}\\s+([A-Za-z]+-\\d{2})\\s+([\\d.]+(?:\\s+[\\d.]+)*)`)  );
-    if(!m)continue;
-    const exp=normExp(m[1]);
-    if(!exp)continue;
-    // Extract all numbers from the rest of the line
-    const nums=(m[0].match(/[\d.]+/g)||[]).map(Number).filter(n=>n>20&&n<200);
-    // Settle price: for lines with full OHLC, it's the 5th price-like number
-    // For lines with only settle (no trades), it's just 1 number
-    // We use the number that appears after OPEN HIGH LOW CLOSE pattern
-    // Heuristic: settle is typically around 70-80 for cotton, find the one after index 4
-    // Better: parse explicitly
-    const allNums=line.match(/[\d.]+/g)||[];
-    // Find position of CT in line
+    // Line format: "   KC   May-26   315.70   316.95   306.60   307.10   307.65   -8.45   15,021 ..."
+    // Tokens: [TICKER, MON-YY, OPEN, HIGH, LOW, CLOSE, SETTLE, CHANGE, VOL, OI, ...]
+    // Settle is always token index 6 (0-based) when full OHLC present
+    // When no OHLC (settle-only line): [TICKER, MON-YY, SETTLE, CHANGE, VOL, OI, ...]
+    const tokens=line.trim().split(/\s+/);
+    if(tokens[0]!==fpfx)continue;
+    if(!tokens[1]||!/^[A-Za-z]+-\d{2}$/.test(tokens[1]))continue;
+    const exp=normExp(tokens[1]); if(!exp)continue;
+    // Strip commas from all tokens, parse as numbers
+    const nums=tokens.slice(2).map(t=>parseFloat(t.replace(/,/g,'')));
+    // Settle = index 4 (after OPEN,HIGH,LOW,CLOSE) if 7+ numbers, else index 0
     let settle=null;
-    // Try explicit settle column: after "CT MON-YY" there's OPEN HIGH LOW CLOSE SETTLE
-    // settle is usually 5th or 6th numeric value
-    const priceNums=allNums.filter(n=>{const v=parseFloat(n);return v>30&&v<200;});
-    if(priceNums.length>=5) settle=parseFloat(priceNums[4]);
-    else if(priceNums.length>=1) settle=parseFloat(priceNums[0]);
-    if(settle&&settle>30&&settle<200) prices[exp]=settle;
+    if(nums.length>=7){
+      settle=nums[4]; // OPEN=0,HIGH=1,LOW=2,CLOSE=3,SETTLE=4
+    } else if(nums.length>=1){
+      settle=nums[0];
+    }
+    // Sanity: settle must be a positive finite number
+    if(settle&&isFinite(settle)&&settle>0) prices[exp]=settle;
   }
   return prices;
 }
 
+// ═══════════════════ OPTIONS PDF PARSER ═══════════════════
+function parseOptionsPDF(txt){
+  const data={calls:{},puts:{}};
+  const pfx=getComm().optionPrefix;
+  const lines=txt.split('\n');
+  for(const line of lines){
+    // Line format (trimmed):
+    // "KC  May-26  210.00  C  0.9803  97.65  -8.45  0  18  0  0  0  0  0"   (no trade = 9 after delta)
+    // "KC  May-26  295.00  C  0.7195  16.80  16.80  16.80  16.80  16.32  -7.46  5  360  -5  ..." (traded = 13+ after delta)
+    // Position: [TICKER, MON-YY, STRIKE, C/P, DELTA, ...rest]
+    const tokens=line.trim().split(/\s+/);
+    if(tokens[0]!==pfx)continue;
+    if(!tokens[1]||!/^[A-Za-z]+-\d{2}$/.test(tokens[1]))continue;
+    const exp=normExp(tokens[1]); if(!exp)continue;
+    const strike=parseFloat(tokens[2]); if(isNaN(strike))continue;
+    const pc=tokens[3]; if(pc!=='C'&&pc!=='P')continue;
+    const delta=parseFloat(tokens[4]); if(isNaN(delta))continue;
+    // Rest of tokens after delta — strip commas, parse numbers
+    const rest=tokens.slice(5).map(t=>parseFloat(t.replace(/,/g,'')));
+    let price=0,vol=0,oi=0,oiChange=0;
+    // Determine format by count:
+    // No trade (OHLC blank): SETTLE CHANGE VOL OI OICHG EXER BLOCK EOO SPREAD = 9 nums
+    // Traded (OHLC present): OPEN HIGH LOW CLOSE SETTLE CHANGE VOL OI OICHG EXER BLOCK EOO SPREAD = 13 nums
+    if(rest.length>=13){
+      // Traded: OPEN=0,HIGH=1,LOW=2,CLOSE=3,SETTLE=4,CHANGE=5,VOL=6,OI=7,OICHG=8
+      price=rest[4]; vol=Math.round(rest[6]); oi=Math.round(rest[7]); oiChange=Math.round(rest[8]);
+    } else if(rest.length>=5){
+      // No trade: SETTLE=0,CHANGE=1,VOL=2,OI=3,OICHG=4
+      price=rest[0]; vol=Math.round(rest[2]); oi=Math.round(rest[3]); oiChange=Math.round(rest[4]);
+    }
+    if(!isFinite(price)||price<0) price=0;
+    if(oi>0||price>0.001){
+      const side=pc==='C'?'calls':'puts';
+      if(!data[side][exp])data[side][exp]={};
+      data[side][exp][strike]={oi,vol,price,oiChange,delta};
+    }
+  }
+  return data;
+}
+
+  // Pattern: CT May-26 70.00 70.88 68.60 70.70 70.76 0.76 ...
+  // or simpler: CT May-26 ... 70.76 (settle is 5th number typically)
 // ═══════════════════ OPTIONS PDF PARSER ═══════════════════
 function parseOptionsPDF(txt){
   const data={calls:{},puts:{}};
