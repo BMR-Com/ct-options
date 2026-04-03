@@ -1238,15 +1238,15 @@ function cellVal(dayData,prevData,weekData,side,exp,strike,tab){
     case 'vol':return rec?.vol||0;
     case 'wkvol':{let t=0;Object.values(days).forEach(d=>{t+=d?.[sk]?.[exp]?.[strike]?.vol||0;});return t;}
     case 'price':return rec?.price||0;
-    case 'iv':{const v=avgIV(exp,strike,dayData||{});return v||0;}
+    case 'iv':{const v=avgIV(exp,strike,dayData||{},latestDate);return v||0;}
     case 'ivchg':{
-      const v=avgIV(exp,strike,dayData||{});
-      const vp=prevData?avgIV(exp,strike,prevData):null;
+      const v=avgIV(exp,strike,dayData||{},latestDate);
+      const vp=prevData?avgIV(exp,strike,prevData,prevDate):null;
       return(v!==null&&vp!==null)?v-vp:0;
     }
     case 'wkivchg':{
-      const v=avgIV(exp,strike,dayData||{});
-      const vw=weekData?avgIV(exp,strike,weekData):null;
+      const v=avgIV(exp,strike,dayData||{},latestDate);
+      const vw=weekData?avgIV(exp,strike,weekData,weekDate):null;
       return(v!==null&&vw!==null)?v-vw:0;
     }
     default:return 0;
@@ -1805,7 +1805,7 @@ function renderGamma(){
   const sorted=Array.from(strikes).sort((a,b)=>a-b);
 
   const rows=sorted.map(K=>{
-    const iv=avgIV(exp,K,dd); if(!iv)return null;
+    const iv=avgIV(exp,K,dd,latestDate); if(!iv)return null;
     const cG=b76Greeks(F,K,T,R,iv,true);
     const pG=b76Greeks(F,K,T,R,iv,false);
     const cLots=src==='puts'?0:(dd.calls?.[exp]?.[K]?.oi||0);
@@ -1865,9 +1865,13 @@ function renderGreeks(){
   const T=getT(exp,latestDate);
   const strikes=new Set([...Object.keys(dd.calls?.[exp]||{}),...Object.keys(dd.puts?.[exp]||{})].map(Number));
   const atm=F;
-  const byDist=[...strikes].sort((a,b)=>Math.abs(a-atm)-Math.abs(b-atm));
-  const keep=new Set(byDist.slice(0,35));
-  const sortedSt=[...strikes].filter(s=>keep.has(s)).sort((a,b)=>b-a);
+  // Expand to ±20 strikes from ATM (includes synthetic vol surface strikes)
+  const syntheticRange=[];
+  for(let dK=-20;dK<=20;dK++) syntheticRange.push(Math.round(atm)+dK);
+  const allSt=new Set([...strikes,...syntheticRange]);
+  const byDist=[...allSt].sort((a,b)=>Math.abs(a-atm)-Math.abs(b-atm));
+  const keep=new Set(byDist.slice(0,41));
+  const sortedSt=[...allSt].filter(s=>keep.has(s)).sort((a,b)=>b-a);
 
   // Header: Strike | Call Pr | Call OI | IV% | C-Δ | C-Γ | C-Vega | C-Θ | sep | Put Pr | Put OI | P-Δ | P-Γ | P-Vega | P-Θ
   let h='<table><thead><tr>';
@@ -2034,24 +2038,24 @@ function getSmileData(dayData, exp, side){
   return pts.sort((a,b)=>a.strike-b.strike);
 }
 
-function atmIV(dayData, exp){
-  if(!dayData||!futPrices[exp])return null;
-  const F=getFutPrice(exp,latestDate)||futPrices[exp];
-  const allK=new Set([...Object.keys(dayData.calls?.[exp]||{}),...Object.keys(dayData.puts?.[exp]||{})].map(Number));
-  if(!allK.size)return null;
-  const nearK=Array.from(allK).reduce((a,b)=>Math.abs(b-F)<Math.abs(a-F)?b:a);
-  const iv=avgIV(exp,nearK,dayData);
-  return iv?iv*100:null;
+function atmIV(dayData, exp, dateStr){
+  // dateStr ensures we use the correct futures price AND getT for that day
+  const dk=dateStr||latestDate;
+  const F=getFutPrice(exp,dk)||futPrices[exp];
+  if(!dayData||!F)return null;
+  // Use getATMIV which uses the vol surface engine (total variance, ±20 strikes)
+  const v=getATMIV(exp,dayData,dk);
+  return v?v*100:null;
 }
 
-function skew25d(dayData, exp){
-  // IV(nearest 25Δ Put strike) − IV(nearest 25Δ Call strike), using avgIV
-  if(!dayData||!futPrices[exp])return null;
-  const F=getFutPrice(exp,latestDate)||futPrices[exp], T=getT(exp,latestDate);
+function skew25d(dayData, exp, dateStr){
+  const dk=dateStr||latestDate;
+  if(!dayData||!getFutPrice(exp,dk))return null;
+  const F=getFutPrice(exp,dk), T=getT(exp,dk);
   const allK=new Set([...Object.keys(dayData.calls?.[exp]||{}),...Object.keys(dayData.puts?.[exp]||{})].map(Number));
   let bestCall=null,bestCallDiff=1,bestPut=null,bestPutDiff=1;
   for(const K of allK){
-    const iv=avgIV(exp,K,dayData); if(!iv)continue;
+    const iv=avgIV(exp,K,dayData,dk); if(!iv)continue;
     const dC=Math.abs(b76Greeks(F,K,T,R,iv,true).delta);
     const dP=Math.abs(b76Greeks(F,K,T,R,iv,false).delta);
     if(Math.abs(dC-0.25)<bestCallDiff){bestCallDiff=Math.abs(dC-0.25);bestCall={K,iv};}
@@ -2214,9 +2218,9 @@ function renderVolSmile(){
 
   // ── ATM TERM STRUCTURE ──
   const termLabels=exps.map(e=>EXP_LBL[e]||e);
-  const todayATM=exps.map(e=>atmIV(dd,e));
-  const prevATM=prevDd?exps.map(e=>atmIV(prevDd,e)):null;
-  const weekATM=weekDd?exps.map(e=>atmIV(weekDd,e)):null;
+  const todayATM=exps.map(e=>atmIV(dd,e,latestDate));
+  const prevATM=prevDd?exps.map(e=>atmIV(prevDd,e,prevDate)):null;
+  const weekATM=weekDd?exps.map(e=>atmIV(weekDd,e,weekDate)):null;
   killChart('ch-vs-term');
   const termDs=[{label:'Today',data:todayATM,borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,.15)',borderWidth:2.5,pointRadius:4,tension:0.3,fill:false}];
   if(prevATM)termDs.push({label:prevDate,data:prevATM,borderColor:'rgba(88,166,255,.45)',borderWidth:1.5,pointRadius:3,borderDash:[5,4],tension:0.3,fill:false});
@@ -2224,9 +2228,9 @@ function renderVolSmile(){
   charts['ch-vs-term']=new Chart(document.getElementById('ch-vs-term').getContext('2d'),{type:'line',data:{labels:termLabels,datasets:termDs},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true,labels:{color:'#8b949e',font:{size:8},boxWidth:9,padding:5}},tooltip:{callbacks:{label:c=>` ${c.dataset.label}: ${c.parsed.y?.toFixed(1)||'—'}%`}}},scales:{x:{ticks:{color:'#6e7681',font:{size:8}},grid:{color:'rgba(48,54,61,.5)'}},y:{ticks:{color:'#6e7681',font:{size:7},callback:v=>v+'%'},grid:{color:'rgba(48,54,61,.5)'},title:{display:true,text:'ATM IV %',color:'#6e7681',font:{size:8}}}}}});
 
   // ── 25Δ SKEW TERM STRUCTURE ──
-  const todaySkew=exps.map(e=>skew25d(dd,e));
-  const prevSkew=prevDd?exps.map(e=>skew25d(prevDd,e)):null;
-  const weekSkew=weekDd?exps.map(e=>skew25d(weekDd,e)):null;
+  const todaySkew=exps.map(e=>skew25d(dd,e,latestDate));
+  const prevSkew=prevDd?exps.map(e=>skew25d(prevDd,e,prevDate)):null;
+  const weekSkew=weekDd?exps.map(e=>skew25d(weekDd,e,weekDate)):null;
   killChart('ch-vs-skew');
   const skewDs=[{label:'Today',data:todaySkew,borderColor:'#f0b429',backgroundColor:'rgba(240,180,41,.12)',borderWidth:2.5,pointRadius:4,tension:0.3,fill:false}];
   if(prevSkew)skewDs.push({label:prevDate,data:prevSkew,borderColor:'rgba(240,180,41,.45)',borderWidth:1.5,pointRadius:3,borderDash:[5,4],tension:0.3,fill:false});
@@ -2274,7 +2278,7 @@ function renderVolSmile(){
   document.getElementById('vs-table-title').textContent=`Vol Surface Table · ${vsCallSide==='both'?'Calls':vsCallSide==='calls'?'Calls':'Puts'} · IV% | 1D Δ | Wk Δ`;
   document.getElementById('vs-table-wrap').innerHTML=`<table style="width:100%"><thead>${th}</thead><tbody>${tbRows}</tbody></table>`;
 
-  setSB(`Vol Smile · ${activeExps.length} expiries · ${sortedSt.length} strikes · ATM IV ${atmIV(dd,activeExps[0])?.toFixed(1)||'—'}% · 25Δ Skew ${skew25d(dd,activeExps[0])?.toFixed(2)||'—'}pp`);
+  setSB(`Vol Smile · ${activeExps.length} expiries · ${sortedSt.length} strikes · ATM IV ${atmIV(dd,activeExps[0],latestDate)?.toFixed(1)||'—'}% · 25Δ Skew ${skew25d(dd,activeExps[0],latestDate)?.toFixed(2)||'—'}pp`);
 }
 const TEMPLATES=[
   {name:'Long Call',legs:[{pc:'C',dir:1,strike:null,exp:null,qty:1}]},
